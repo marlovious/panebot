@@ -1,0 +1,14 @@
+/Users/marlovious/gitz/marlovious.panebot/tui/target/debug/deps/serde-55fa29d58b9d5dac.d: /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/marlovious/gitz/marlovious.panebot/tui/target/debug/build/serde-f7820387e22cc7ff/out/private.rs
+
+/Users/marlovious/gitz/marlovious.panebot/tui/target/debug/deps/libserde-55fa29d58b9d5dac.rlib: /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/marlovious/gitz/marlovious.panebot/tui/target/debug/build/serde-f7820387e22cc7ff/out/private.rs
+
+/Users/marlovious/gitz/marlovious.panebot/tui/target/debug/deps/libserde-55fa29d58b9d5dac.rmeta: /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/marlovious/gitz/marlovious.panebot/tui/target/debug/build/serde-f7820387e22cc7ff/out/private.rs
+
+/Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/marlovious/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/marlovious/gitz/marlovious.panebot/tui/target/debug/build/serde-f7820387e22cc7ff/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/marlovious/gitz/marlovious.panebot/tui/target/debug/build/serde-f7820387e22cc7ff/out
