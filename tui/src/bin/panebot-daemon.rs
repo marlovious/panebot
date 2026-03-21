@@ -1,11 +1,12 @@
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
+use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixStream};
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
@@ -25,29 +26,24 @@ const DEFAULT_PANES_CONF: &str = "\
 # pb.panes.conf\n\
 # [panename]\n\
 # type     = video | audio | ytube | rtsp | http\n\
-# geometry = WxH+X+Y   (set by layout, or manually)\n\
 # playlist = /path/to/playlist.m3u\n\
 \n\
 layout = pb.left.stack\n\
 \n\
 [music]\n\
 type     = video\n\
-geometry = 366x366+0+0\n\
 playlist = ~/.config/panebot/music/music.m3u\n\
 \n\
 [wide-top]\n\
 type     = video\n\
-geometry = 650x366+0+374\n\
 playlist = ~/.config/panebot/wide-top/wide-top.m3u\n\
 \n\
 [wide-bottom]\n\
 type     = video\n\
-geometry = 650x366+0+748\n\
 playlist = ~/.config/panebot/wide-bottom/wide-bottom.m3u\n\
 \n\
 [standard]\n\
 type     = video\n\
-geometry = 650x488+0+1122\n\
 playlist = ~/.config/panebot/standard/standard.m3u\n";
 
 const DEFAULT_TYPES_CONF: &str = "\
@@ -82,6 +78,11 @@ rtsp-transport=tcp\n\
 really-quiet=yes\n\
 pause=yes\n\
 force-window=yes\n";
+
+// Layout files — simple INI: [panename] sections with geometry = WxH+X+Y
+// The geometry value is passed directly to mpv --geometry at launch.
+// On Linux/Sway: geometry is ignored — Sway handles placement via window title.
+// Future: add [sway] sections when Sway layout support is built.
 
 const LAYOUT_LEFT_STACK: &str = "\
 # panebot layout — pb.left.stack\n\
@@ -140,6 +141,7 @@ geometry = 2014x1074+6+482\n\
 \n\
 [wide]\n\
 geometry = 858x484+2038+1074\n";
+
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -236,10 +238,9 @@ fn ensure_pane_files(pane: &Pane, types: &HashMap<String, PaneType>, log: &mut L
             }
         }
 
-        if let Some(geo) = &pane.geometry {
-            writeln!(f)?;
-            writeln!(f, "geometry={}", geo)?;
-        }
+        // macOS: initial geometry written here when layout parser is implemented
+        // Linux/Sway: geometry not written — Sway rules handle placement via
+        //             window title matching on pane.name.to_uppercase()
     } else {
         log.log(&format!("ensure_pane :: {} :: mpv.conf exists", pane.name));
     }
@@ -253,71 +254,89 @@ fn ensure_pane_files(pane: &Pane, types: &HashMap<String, PaneType>, log: &mut L
 }
 
 // ---------------------------------------------------------------------------
-// Pane state (shared across tasks)
+// Layout parser
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct PaneState {
-    pub name:         String,
-    pub online:       bool,
-    pub paused:       bool,
-    pub volume:       f64,
-    pub title:        String,
-    pub playlist_pos: i64,
+fn parse_layout(content: &str) -> HashMap<String, String> {
+    let mut map      = HashMap::new();
+    let mut current  = String::new();
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            current = line[1..line.len()-1].to_string();
+            continue;
+        }
+
+        if !current.is_empty() {
+            if let Some(eq) = line.find('=') {
+                let key = line[..eq].trim();
+                let val = line[eq+1..].trim().to_string();
+                if key == "geometry" {
+                    map.insert(current.clone(), val);
+                }
+            }
+        }
+    }
+
+    map
 }
 
-impl PaneState {
-    fn new(name: &str) -> Self {
-        PaneState {
-            name:         name.to_string(),
-            online:       false,
-            paused:       true,
-            volume:       0.0,
-            title:        String::new(),
-            playlist_pos: -1,
+fn load_layout(name: &str, log: &mut Logger) -> Option<HashMap<String, String>> {
+    let path = layouts_dir().join(format!("{}.layout", name));
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let map = parse_layout(&content);
+            log.log(&format!("layout :: loaded {} ({} entries)", name, map.len()));
+            Some(map)
+        }
+        Err(e) => {
+            log.log(&format!("layout :: failed to load {}: {}", name, e));
+            None
         }
     }
 }
 
-type SharedState = Arc<Mutex<HashMap<String, PaneState>>>;
-
-// ---------------------------------------------------------------------------
-// mpv IPC helpers
-// ---------------------------------------------------------------------------
-
-fn mpv_command(socket: &str, args: &[serde_json::Value]) -> Option<serde_json::Value> {
-    let mut stream = UnixStream::connect(socket).ok()?;
-    stream.set_read_timeout(Some(Duration::from_millis(500))).ok()?;
-    let cmd = serde_json::json!({ "command": args });
-    let mut line = cmd.to_string();
-    line.push('\n');
-    stream.write_all(line.as_bytes()).ok()?;
-    let reader = BufReader::new(stream);
-    for l in reader.lines() {
-        let l = l.ok()?;
-        let v: serde_json::Value = serde_json::from_str(&l).ok()?;
-        if v["error"] == "success" {
-            return Some(v["data"].clone());
+fn apply_layout(layout_map: &HashMap<String, String>, panes: &[Pane], log: &mut Logger) {
+    for pane in panes {
+        if let Some(geo) = layout_map.get(&pane.name) {
+            if cfg!(target_os = "macos") {
+                apply_geometry_macos(&pane.name, geo, log);
+            } else {
+                log.log(&format!("layout :: {} :: skipping geometry on linux (Sway handles placement)", pane.name));
+            }
+        } else {
+            log.log(&format!("layout :: no entry for pane {}", pane.name));
         }
     }
-    None
 }
 
-fn mpv_send(socket: &str, args: &[serde_json::Value]) {
-    if let Ok(mut stream) = UnixStream::connect(socket) {
-        let cmd = serde_json::json!({ "command": args });
-        let mut line = cmd.to_string();
-        line.push('\n');
-        let _ = stream.write_all(line.as_bytes());
+// On macOS: write geometry to mpv.conf and restart the pane.
+// mpv respects --geometry=WxH+X+Y at launch.
+fn apply_geometry_macos(pane_name: &str, geometry: &str, log: &mut Logger) {
+    let mpv_conf = pane_mpv_conf(pane_name);
+
+    // Read existing conf, replace or append geometry line
+    let content = std::fs::read_to_string(&mpv_conf).unwrap_or_default();
+    let mut lines: Vec<String> = content.lines()
+        .filter(|l| !l.trim().starts_with("geometry="))
+        .map(|l| l.to_string())
+        .collect();
+    lines.push(format!("geometry={}", geometry));
+
+    if let Err(e) = std::fs::write(&mpv_conf, lines.join("\n") + "\n") {
+        log.log(&format!("layout.macos :: {} :: failed to write mpv.conf: {}", pane_name, e));
+        return;
     }
-}
 
-fn socket_alive(socket: &str) -> bool {
-    UnixStream::connect(socket).is_ok()
+    log.log(&format!("layout.macos :: {} :: geometry={}", pane_name, geometry));
+    // Pane will pick up geometry on next restart — caller handles restart if needed
 }
 
 // ---------------------------------------------------------------------------
-// Launch mpv
+// Launch / kill mpv
 // ---------------------------------------------------------------------------
 
 fn launch_pane(pane: &Pane, log: &mut Logger) {
@@ -329,6 +348,9 @@ fn launch_pane(pane: &Pane, log: &mut Logger) {
         format!("--input-ipc-server={}", socket.to_string_lossy()),
         format!("--title={}", pane.name.to_uppercase()),
         format!("--include={}", mpv_conf.to_string_lossy()),
+        "--volume=100".to_string(),
+        "--mute=yes".to_string(),
+        "--pause=yes".to_string(),
     ];
 
     if playlist.exists() && playlist.metadata().map(|m| m.len() > 0).unwrap_or(false) {
@@ -339,6 +361,7 @@ fn launch_pane(pane: &Pane, log: &mut Logger) {
 
     match std::process::Command::new("mpv")
         .args(&args)
+        .process_group(0)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -349,51 +372,124 @@ fn launch_pane(pane: &Pane, log: &mut Logger) {
     }
 }
 
+async fn kill_pane_async(pane_name: &str, log: &mut Logger) {
+    let socket = pane_socket(pane_name).to_string_lossy().to_string();
+    match UnixStream::connect(&socket).await {
+        Ok(mut stream) => {
+            let cmd = serde_json::json!({"command":["quit"]}).to_string() + "\n";
+            let _ = stream.write_all(cmd.as_bytes()).await;
+            log.log(&format!("kill :: {} :: quit sent", pane_name));
+        }
+        Err(_) => {
+            log.log(&format!("kill :: {} :: socket not found, already dead", pane_name));
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Per-pane monitor task
+// Pane state
+//
+// Tracks all observable mpv properties for a pane.
+// idle_active: true  = stopped (no file playing, mpv is idle)
+// idle_active: false = a file is loaded (may be paused or playing)
+// paused:      true  = explicitly paused
+// muted:       true  = muted via mpv mute property
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PaneState {
+    pub name:         String,
+    pub pane_type:    String,
+    pub online:       bool,
+    pub idle_active:  bool,
+    pub paused:       bool,
+    pub muted:        bool,
+    pub volume:       f64,
+    pub title:        String,
+    pub playlist_pos: i64,
+}
+
+impl PaneState {
+    fn new(name: &str, pane_type: &str) -> Self {
+        PaneState {
+            name:         name.to_string(),
+            pane_type:    pane_type.to_string(),
+            online:       false,
+            idle_active:  true,
+            paused:       true,
+            muted:        false,
+            volume:       0.0,
+            title:        String::new(),
+            playlist_pos: -1,
+        }
+    }
+}
+
+type SharedState  = Arc<Mutex<HashMap<String, PaneState>>>;
+type PaneCommands = Arc<Mutex<HashMap<String, mpsc::Sender<String>>>>;
+type SharedPanes  = Arc<Vec<Pane>>;
+type ShutdownTx   = Arc<tokio::sync::Notify>;
+
+// ---------------------------------------------------------------------------
+// mpv IPC — async per-pane monitor
+// ---------------------------------------------------------------------------
+
+async fn socket_alive(socket: &str) -> bool {
+    UnixStream::connect(socket).await.is_ok()
+}
 
 async fn monitor_pane(
     pane:  Pane,
     state: SharedState,
     tx:    broadcast::Sender<String>,
+    cmds:  PaneCommands,
 ) {
-    let socket = pane_socket(&pane.name).to_string_lossy().to_string();
+    let socket_path = pane_socket(&pane.name).to_string_lossy().to_string();
 
     loop {
-        if !socket_alive(&socket) {
+        if !socket_alive(&socket_path).await {
             {
                 let mut s = state.lock().unwrap();
-                let ps = s.entry(pane.name.clone()).or_insert_with(|| PaneState::new(&pane.name));
+                let ps = s.entry(pane.name.clone())
+                    .or_insert_with(|| PaneState::new(&pane.name, &pane.pane_type));
                 if ps.online {
                     ps.online = false;
-                    let event = serde_json::json!({
+                    let _ = tx.send(serde_json::json!({
                         "pane":  pane.name,
                         "event": "offline"
-                    });
-                    let _ = tx.send(event.to_string());
+                    }).to_string());
                 }
             }
             tokio::time::sleep(Duration::from_millis(500)).await;
             continue;
         }
 
-        let mut stream = match UnixStream::connect(&socket) {
+        let stream = match UnixStream::connect(&socket_path).await {
             Ok(s)  => s,
             Err(_) => { tokio::time::sleep(Duration::from_millis(200)).await; continue; }
         };
+
+        // Fresh channel on each reconnect — fixes consumed cmd_rx bug
+        let (cmd_tx, cmd_rx) = mpsc::channel::<String>(32);
+        cmds.lock().unwrap().insert(pane.name.clone(), cmd_tx);
+
+        let (read_half, mut write_half) = tokio::io::split(stream);
+        let mut reader = BufReader::new(read_half);
 
         let subs = [
             serde_json::json!({"command":["observe_property",1,"pause"]}),
             serde_json::json!({"command":["observe_property",2,"volume"]}),
             serde_json::json!({"command":["observe_property",3,"media-title"]}),
             serde_json::json!({"command":["observe_property",4,"playlist-pos"]}),
+            serde_json::json!({"command":["observe_property",5,"mute"]}),
+            serde_json::json!({"command":["observe_property",6,"idle-active"]}),
         ];
+
         let mut sub_ok = true;
         for sub in &subs {
             let mut line = sub.to_string();
             line.push('\n');
-            if stream.write_all(line.as_bytes()).is_err() {
+            if write_half.write_all(line.as_bytes()).await.is_err() {
                 sub_ok = false;
                 break;
             }
@@ -405,48 +501,73 @@ async fn monitor_pane(
 
         {
             let mut s = state.lock().unwrap();
-            let ps = s.entry(pane.name.clone()).or_insert_with(|| PaneState::new(&pane.name));
+            let ps = s.entry(pane.name.clone())
+                .or_insert_with(|| PaneState::new(&pane.name, &pane.pane_type));
             ps.online = true;
-            let event = serde_json::json!({
+            let _ = tx.send(serde_json::json!({
                 "pane":  pane.name,
                 "event": "online"
-            });
-            let _ = tx.send(event.to_string());
+            }).to_string());
         }
 
-        let reader = BufReader::new(stream);
-        for line in reader.lines() {
-            let line = match line {
-                Ok(l)  => l,
-                Err(_) => break,
-            };
+        let pane_name = pane.name.clone();
+        let pane_type = pane.pane_type.clone();
+        let state_r   = state.clone();
+        let tx_r      = tx.clone();
 
-            let v: serde_json::Value = match serde_json::from_str(&line) {
-                Ok(v)  => v,
-                Err(_) => continue,
-            };
-
-            if v["event"] == "property-change" {
-                let prop  = v["name"].as_str().unwrap_or("");
-                let mut s = state.lock().unwrap();
-                let ps    = s.entry(pane.name.clone()).or_insert_with(|| PaneState::new(&pane.name));
-
-                match prop {
-                    "pause"        => { ps.paused       = v["data"].as_bool().unwrap_or(true); }
-                    "volume"       => { ps.volume        = v["data"].as_f64().unwrap_or(0.0); }
-                    "media-title"  => { ps.title         = v["data"].as_str().unwrap_or("").to_string(); }
-                    "playlist-pos" => { ps.playlist_pos  = v["data"].as_i64().unwrap_or(-1); }
-                    _ => continue,
+        let read_task = tokio::spawn(async move {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
                 }
 
-                let event = serde_json::json!({
-                    "pane":     pane.name,
-                    "event":    "property-change",
-                    "property": prop,
-                    "value":    v["data"],
-                });
-                let _ = tx.send(event.to_string());
+                let v: serde_json::Value = match serde_json::from_str(line.trim()) {
+                    Ok(v)  => v,
+                    Err(_) => continue,
+                };
+
+                if v["event"] == "property-change" {
+                    let prop  = v["name"].as_str().unwrap_or("").to_string();
+                    let mut s = state_r.lock().unwrap();
+                    let ps    = s.entry(pane_name.clone())
+                        .or_insert_with(|| PaneState::new(&pane_name, &pane_type));
+
+                    match prop.as_str() {
+                        "pause"        => { ps.paused      = v["data"].as_bool().unwrap_or(true); }
+                        "volume"       => { ps.volume       = v["data"].as_f64().unwrap_or(0.0); }
+                        "media-title"  => { ps.title        = v["data"].as_str().unwrap_or("").to_string(); }
+                        "playlist-pos" => { ps.playlist_pos = v["data"].as_i64().unwrap_or(-1); }
+                        "mute"         => { ps.muted        = v["data"].as_bool().unwrap_or(false); }
+                        "idle-active"  => { ps.idle_active  = v["data"].as_bool().unwrap_or(true); }
+                        _ => continue,
+                    }
+
+                    let _ = tx_r.send(serde_json::json!({
+                        "pane":     pane_name,
+                        "event":    "property-change",
+                        "property": prop,
+                        "value":    v["data"],
+                    }).to_string());
+                }
             }
+        });
+
+        let write_task = tokio::spawn(async move {
+            let mut cmd_rx = cmd_rx;
+            while let Some(mut cmd) = cmd_rx.recv().await {
+                cmd.push('\n');
+                if write_half.write_all(cmd.as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+        });
+
+        tokio::select! {
+            _ = read_task  => {}
+            _ = write_task => {}
         }
 
         {
@@ -454,11 +575,10 @@ async fn monitor_pane(
             if let Some(ps) = s.get_mut(&pane.name) {
                 ps.online = false;
             }
-            let event = serde_json::json!({
+            let _ = tx.send(serde_json::json!({
                 "pane":  pane.name,
                 "event": "offline"
-            });
-            let _ = tx.send(event.to_string());
+            }).to_string());
         }
 
         tokio::time::sleep(Duration::from_millis(500)).await;
@@ -474,6 +594,9 @@ async fn handle_ws(
     state:     SharedState,
     tx:        broadcast::Sender<String>,
     bootstrap: String,
+    cmds:      PaneCommands,
+    panes:     SharedPanes,
+    shutdown:  ShutdownTx,
 ) {
     let ws = match accept_async(stream).await {
         Ok(ws) => ws,
@@ -483,10 +606,8 @@ async fn handle_ws(
     let (mut sink, mut source) = ws.split();
     let mut rx = tx.subscribe();
 
-    // bootstrap_complete is always the first message to any connecting client
     let _ = sink.send(Message::Text(bootstrap)).await;
 
-    // Follow with a snapshot of current live state
     let state_msgs: Vec<String> = {
         let s = state.lock().unwrap();
         s.values().map(|ps| serde_json::json!({
@@ -510,7 +631,7 @@ async fn handle_ws(
             msg = source.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_command(&text, &state);
+                        handle_command(&text, &state, &cmds, &panes, &tx, &shutdown).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -524,43 +645,315 @@ async fn handle_ws(
 // Command handler
 // ---------------------------------------------------------------------------
 
-fn handle_command(text: &str, _state: &SharedState) {
+async fn handle_command(
+    text:     &str,
+    state:    &SharedState,
+    cmds:     &PaneCommands,
+    panes:    &SharedPanes,
+    tx:       &broadcast::Sender<String>,
+    shutdown: &ShutdownTx,
+) {
     let v: serde_json::Value = match serde_json::from_str(text) {
         Ok(v)  => v,
         Err(_) => return,
     };
+
+    let cmd = match v["command"].as_str() {
+        Some(c) => c.to_string(),
+        None    => return,
+    };
+
+    if cmd.starts_with("panebot:") {
+        handle_node_command(&cmd, &v, state, cmds, panes, tx, shutdown).await;
+        return;
+    }
 
     let pane_name = match v["pane"].as_str() {
         Some(n) => n.to_string(),
         None    => return,
     };
 
-    let socket = pane_socket(&pane_name).to_string_lossy().to_string();
-    if !socket_alive(&socket) { return; }
-
-    let cmd = match v["command"].as_array() {
-        Some(c) => c.clone(),
+    let args = match v["args"].as_array() {
+        Some(a) => a.clone(),
         None    => return,
     };
 
     let allowed = matches!(
-        cmd.first().and_then(|v| v.as_str()).unwrap_or(""),
-        "keypress"        |
-        "set_property"    |
-        "playlist-next"   |
-        "playlist-prev"   |
-        "playlist-remove" |
-        "playlist-move"   |
-        "playlist-clear"  |
-        "loadfile"        |
-        "seek"            |
-        "stop"            |
-        "quit"
+        cmd.as_str(),
+        "set_property"       |
+        "cycle"              |
+        "add"                |
+        "stop"               |
+        "quit"               |
+        "seek"               |
+        "revert-seek"        |
+        "playlist-next"      |
+        "playlist-prev"      |
+        "playlist-play-index"|
+        "playlist-remove"    |
+        "playlist-move"      |
+        "playlist-shuffle"   |
+        "playlist-unshuffle" |
+        "playlist-clear"     |
+        "loadfile"           |
+        "loadlist"           |
+        "keypress"           |
+        "keydown"            |
+        "keyup"
+        // "show-text" -- OSD, enable when needed
     );
 
-    if allowed {
-        mpv_send(&socket, &cmd);
+    if !allowed { return; }
+
+    let mut mpv_cmd = vec![serde_json::Value::String(cmd)];
+    mpv_cmd.extend(args);
+    let cmd_str = serde_json::json!({ "command": mpv_cmd }).to_string();
+
+    let sender = cmds.lock().unwrap().get(&pane_name).cloned();
+    if let Some(s) = sender {
+        let _ = s.send(cmd_str).await;
     }
+}
+
+// ---------------------------------------------------------------------------
+// Node command handler
+// ---------------------------------------------------------------------------
+
+async fn handle_node_command(
+    cmd:      &str,
+    v:        &serde_json::Value,
+    state:    &SharedState,
+    cmds:     &PaneCommands,
+    panes:    &SharedPanes,
+    tx:       &broadcast::Sender<String>,
+    shutdown: &ShutdownTx,
+) {
+    match cmd {
+
+        "panebot:node-info" => {
+            let s     = state.lock().unwrap();
+            let ps: Vec<&PaneState> = s.values().collect();
+            let _ = tx.send(serde_json::json!({
+                "event":    "node:info",
+                "hostname": hostname(),
+                "platform": platform(),
+                "panes":    ps,
+            }).to_string());
+        }
+
+        "panebot:node-status" => {
+            let s     = state.lock().unwrap();
+            let ps: Vec<&PaneState> = s.values().collect();
+            let _ = tx.send(serde_json::json!({
+                "event": "node:status",
+                "panes": ps,
+            }).to_string());
+        }
+
+        "panebot:stop-all" => {
+            let senders: Vec<_> = cmds.lock().unwrap().values().cloned().collect();
+            let cmd = serde_json::json!({"command":["stop"]}).to_string();
+            for s in senders { let _ = s.send(cmd.clone()).await; }
+        }
+
+        "panebot:start-all" => {
+            let senders: Vec<_> = cmds.lock().unwrap().values().cloned().collect();
+            let cmd = serde_json::json!({"command":["set_property","pause",false]}).to_string();
+            for s in senders { let _ = s.send(cmd.clone()).await; }
+        }
+
+        "panebot:restart-all" => {
+            let mut log = Logger::open().unwrap();
+            for pane in panes.iter() {
+                kill_pane_async(&pane.name, &mut log).await;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            for pane in panes.iter() {
+                launch_pane(pane, &mut log);
+            }
+            let _ = tx.send(serde_json::json!({"event":"node:restart-all"}).to_string());
+        }
+
+        "panebot:restart-pane" => {
+            let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
+            if let Some(pane) = panes.iter().find(|p| p.name == pane_name) {
+                let mut log = Logger::open().unwrap();
+                kill_pane_async(&pane.name, &mut log).await;
+                tokio::time::sleep(Duration::from_millis(3000)).await;
+                launch_pane(pane, &mut log);
+                let _ = tx.send(serde_json::json!({
+                    "event": "node:restart-pane",
+                    "pane":  pane_name,
+                }).to_string());
+            }
+        }
+
+        "panebot:reload-playlist" => {
+            let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
+            let playlist  = pane_playlist(&pane_name);
+            let sender    = cmds.lock().unwrap().get(&pane_name).cloned();
+            if let Some(s) = sender {
+                let cmd = serde_json::json!({
+                    "command": ["loadlist", playlist.to_string_lossy(), "replace"]
+                }).to_string();
+                let _ = s.send(cmd).await;
+            }
+        }
+
+        "panebot:solo" => {
+            let solo    = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
+            let senders = cmds.lock().unwrap().clone();
+            for (name, s) in &senders {
+                if *name == solo {
+                    let _ = s.send(serde_json::json!({"command":["set_property","mute",false]}).to_string()).await;
+                    let _ = s.send(serde_json::json!({"command":["set_property","pause",false]}).to_string()).await;
+                } else {
+                    let _ = s.send(serde_json::json!({"command":["set_property","mute",true]}).to_string()).await;
+                }
+            }
+        }
+
+        "panebot:mute-others" => {
+            let keep    = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
+            let senders = cmds.lock().unwrap().clone();
+            for (name, s) in &senders {
+                if *name != keep {
+                    let _ = s.send(serde_json::json!({"command":["set_property","mute",true]}).to_string()).await;
+                }
+            }
+        }
+
+        "panebot:swap-volume" => {
+            let pane_a = match v["pane_a"].as_str() { Some(n) => n.to_string(), None => return };
+            let pane_b = match v["pane_b"].as_str() { Some(n) => n.to_string(), None => return };
+            let (vol_a, vol_b) = {
+                let s  = state.lock().unwrap();
+                let va = s.get(&pane_a).map(|p| p.volume).unwrap_or(0.0);
+                let vb = s.get(&pane_b).map(|p| p.volume).unwrap_or(0.0);
+                (va, vb)
+            };
+            let senders = cmds.lock().unwrap().clone();
+            if let Some(s) = senders.get(&pane_a) {
+                let _ = s.send(serde_json::json!({"command":["set_property","volume",vol_b]}).to_string()).await;
+            }
+            if let Some(s) = senders.get(&pane_b) {
+                let _ = s.send(serde_json::json!({"command":["set_property","volume",vol_a]}).to_string()).await;
+            }
+        }
+
+        "panebot:set-volume-all" => {
+            let vol     = match v["volume"].as_f64() { Some(v) => v, None => return };
+            let senders: Vec<_> = cmds.lock().unwrap().values().cloned().collect();
+            let cmd     = serde_json::json!({"command":["set_property","volume",vol]}).to_string();
+            for s in senders { let _ = s.send(cmd.clone()).await; }
+        }
+
+        "panebot:layout" => {
+            let layout_name = match v["layout_name"].as_str() { Some(n) => n.to_string(), None => return };
+            let mut log = Logger::open().unwrap();
+            if let Some(layout_map) = load_layout(&layout_name, &mut log) {
+                apply_layout(&layout_map, panes, &mut log);
+
+                // Snapshot state before killing so we can restore after relaunch
+                let snapshots: Vec<(String, f64, bool, bool)> = {
+                    let s = state.lock().unwrap();
+                    panes.iter().map(|pane| {
+                        let ps = s.get(&pane.name);
+                        let volume = ps.map(|p| p.volume).unwrap_or(100.0);
+                        let muted  = ps.map(|p| p.muted).unwrap_or(false);
+                        let paused = ps.map(|p| p.paused).unwrap_or(true);
+                        (pane.name.clone(), volume, muted, paused)
+                    }).collect()
+                };
+
+                log.log(&format!("layout :: restarting {} panes", panes.len()));
+                for pane in panes.iter() {
+                    kill_pane_async(&pane.name, &mut log).await;
+                }
+
+                for pane in panes.iter() {
+                    launch_pane(pane, &mut log);
+                }
+
+                // Poll each pane socket until alive (max 5s), then restore state
+                for (pane_name, volume, muted, _paused) in &snapshots {
+                    let socket = pane_socket(pane_name).to_string_lossy().to_string();
+                    let mut alive = false;
+                    for _ in 0..50 {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        if socket_alive(&socket).await {
+                            alive = true;
+                            break;
+                        }
+                    }
+                    if alive {
+                        let sender = cmds.lock().unwrap().get(pane_name).cloned();
+                        if let Some(s) = sender {
+                            let _ = s.send(serde_json::json!({"command":["set_property","volume",volume]}).to_string()).await;
+                            let _ = s.send(serde_json::json!({"command":["set_property","mute",muted]}).to_string()).await;
+                            let _ = s.send(serde_json::json!({"command":["set_property","pause",true]}).to_string()).await;
+                            log.log(&format!("layout :: {} :: state restored (vol={:.0} mute={})", pane_name, volume, muted));
+                        }
+                    } else {
+                        log.log(&format!("layout :: {} :: socket did not come up in time", pane_name));
+                    }
+                }
+
+                let _ = tx.send(serde_json::json!({
+                    "event":  "node:layout",
+                    "layout": layout_name,
+                }).to_string());
+            }
+        }
+
+        "panebot:reload-config" => {
+            // TODO: requires panes to be Arc<Mutex<Vec<Pane>>> for hot-add/remove
+            let _ = tx.send(serde_json::json!({
+                "event":  "node:reload-config",
+                "status": "not-yet-implemented",
+                "reason": "requires mutable shared pane list"
+            }).to_string());
+        }
+
+        "panebot:shutdown" => {
+            let _ = tx.send(serde_json::json!({
+                "event":  "node:down",
+                "reason": "admin"
+            }).to_string());
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            shutdown.notify_one();
+        }
+
+        _ => {}
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Platform helpers
+// ---------------------------------------------------------------------------
+
+fn hostname() -> String {
+    if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
+        let h = h.trim().to_string();
+        if !h.is_empty() { return h; }
+    }
+    if let Ok(h) = std::env::var("HOSTNAME") {
+        if !h.is_empty() { return h; }
+    }
+    if let Ok(h) = std::env::var("HOST") {
+        if !h.is_empty() { return h; }
+    }
+    if let Ok(out) = std::process::Command::new("hostname").output() {
+        let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !h.is_empty() { return h; }
+    }
+    "unknown".to_string()
+}
+
+fn platform() -> &'static str {
+    if      cfg!(target_os = "macos") { "macos" }
+    else if cfg!(target_os = "linux") { "linux" }
+    else                               { "unknown" }
 }
 
 // ---------------------------------------------------------------------------
@@ -569,9 +962,12 @@ fn handle_command(text: &str, _state: &SharedState) {
 
 #[tokio::main]
 async fn main() {
+    std::fs::create_dir_all(config_dir()).expect("Failed to create config dir");
     let mut log = Logger::open().expect("Failed to open log file");
 
     log.log("panebot-daemon :: starting");
+    log.log(&format!("platform :: {}", platform()));
+    log.log(&format!("hostname :: {}", hostname()));
 
     bootstrap(&mut log).expect("Bootstrap failed");
 
@@ -588,36 +984,68 @@ async fn main() {
 
     for pane in &cfg.panes {
         let socket = pane_socket(&pane.name).to_string_lossy().to_string();
-        if socket_alive(&socket) {
+        if socket_alive(&socket).await {
             log.log(&format!("launch :: {} :: already running", pane.name));
         } else {
             launch_pane(pane, &mut log);
         }
     }
 
-    // Snapshot whatever is alive right now — honest status, no settle
-    let bootstrap_panes: Vec<serde_json::Value> = cfg.panes.iter().map(|pane| {
-        let socket = pane_socket(&pane.name).to_string_lossy().to_string();
-        let status = if socket_alive(&socket) { "Online" } else { "Offline" };
-        log.log(&format!("status :: {} :: {}", pane.name, status));
-        serde_json::json!({ "name": pane.name, "status": status })
-    }).collect();
+    // Apply layout — writes geometry to mpv.conf on macOS and restarts panes.
+    // On Linux geometry is skipped; Sway handles placement via window title.
+    // On macOS only restart panes that were freshly spawned — never touch
+    // already-running panes on daemon restart.
+    if let Some(layout_map) = load_layout(&cfg.layout, &mut log) {
+        apply_layout(&layout_map, &cfg.panes, &mut log);
+        if cfg!(target_os = "macos") {
+            for pane in &cfg.panes {
+                let socket = pane_socket(&pane.name).to_string_lossy().to_string();
+                if layout_map.contains_key(&pane.name) && !socket_alive(&socket).await {
+                    kill_pane_async(&pane.name, &mut log).await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    launch_pane(pane, &mut log);
+                }
+            }
+        }
+    }
+
+    let bootstrap_panes: Vec<serde_json::Value> = {
+        let mut out = Vec::new();
+        for pane in &cfg.panes {
+            let socket = pane_socket(&pane.name).to_string_lossy().to_string();
+            let status = if socket_alive(&socket).await { "Online" } else { "Offline" };
+            log.log(&format!("status :: {} :: {}", pane.name, status));
+            out.push(serde_json::json!({
+                "name":      pane.name,
+                "pane_type": pane.pane_type,
+                "status":    status,
+            }));
+        }
+        out
+    };
 
     let bootstrap_complete = serde_json::json!({
-        "event": "bootstrap_complete",
-        "panes": bootstrap_panes,
+        "event":    "bootstrap_complete",
+        "hostname": hostname(),
+        "platform": platform(),
+        "layout":   cfg.layout,
+        "panes":    bootstrap_panes,
     }).to_string();
 
     log.log("panebot-daemon :: bootstrap complete, listening on ws://0.0.0.0:9090");
 
-    let state: SharedState = Arc::new(Mutex::new(HashMap::new()));
-    let (tx, _rx) = broadcast::channel::<String>(256);
+    let panes:    SharedPanes  = Arc::new(cfg.panes);
+    let state:    SharedState  = Arc::new(Mutex::new(HashMap::new()));
+    let cmds:     PaneCommands = Arc::new(Mutex::new(HashMap::new()));
+    let shutdown: ShutdownTx   = Arc::new(tokio::sync::Notify::new());
+    let (tx, _rx)              = broadcast::channel::<String>(256);
 
-    for pane in cfg.panes {
+    for pane in panes.iter().cloned() {
         let s = state.clone();
         let t = tx.clone();
+        let c = cmds.clone();
         tokio::spawn(async move {
-            monitor_pane(pane, s, t).await;
+            monitor_pane(pane, s, t, c).await;
         });
     }
 
@@ -625,15 +1053,26 @@ async fn main() {
         .expect("Failed to bind port 9090");
 
     loop {
-        let (stream, _) = match listener.accept().await {
-            Ok(s)  => s,
-            Err(_) => continue,
-        };
-        let s  = state.clone();
-        let t  = tx.clone();
-        let bc = bootstrap_complete.clone();
-        tokio::spawn(async move {
-            handle_ws(stream, s, t, bc).await;
-        });
+        tokio::select! {
+            _ = shutdown.notified() => {
+                log.log("panebot-daemon :: shutdown by admin");
+                std::process::exit(0);
+            }
+            result = listener.accept() => {
+                let (stream, _) = match result {
+                    Ok(s)  => s,
+                    Err(_) => continue,
+                };
+                let s  = state.clone();
+                let t  = tx.clone();
+                let bc = bootstrap_complete.clone();
+                let c  = cmds.clone();
+                let p  = panes.clone();
+                let sd = shutdown.clone();
+                tokio::spawn(async move {
+                    handle_ws(stream, s, t, bc, c, p, sd).await;
+                });
+            }
+        }
     }
 }
