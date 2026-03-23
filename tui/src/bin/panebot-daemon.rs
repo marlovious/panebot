@@ -79,10 +79,17 @@ really-quiet=yes\n\
 pause=yes\n\
 force-window=yes\n";
 
-// Layout files — simple INI: [panename] sections with geometry = WxH+X+Y
-// The geometry value is passed directly to mpv --geometry at launch.
-// On Linux/Sway: geometry is ignored — Sway handles placement via window title.
-// Future: add [sway] sections when Sway layout support is built.
+// ---------------------------------------------------------------------------
+// Layout files
+//
+// macOS layouts: [panename] sections with geometry = WxH+X+Y
+//   Passed as --geometry arg to mpv at launch. Never written to mpv.conf.
+//
+// Sway layouts: [panename] sections with swaymsg = <criteria> <commands>
+//   Executed via `swaymsg` after pane launch on Linux.
+//   mpv sets window title to PANENAME (uppercase) — Sway matches on that.
+//   geometry key is ignored on Linux.
+// ---------------------------------------------------------------------------
 
 const LAYOUT_LEFT_STACK: &str = "\
 # panebot layout — pb.left.stack\n\
@@ -114,34 +121,39 @@ geometry = 650x366+2290+804\n\
 [standard]\n\
 geometry = 650x488+2290+1180\n";
 
-const LAYOUT_TOP_ROW: &str = "\
-# panebot layout — pb.top.row\n\
+const LAYOUT_SWAY_LEFT_STACK: &str = "\
+# panebot layout — pb.sway.left.stack\n\
+# Sway floating layout, left stack.\n\
+# Windows matched by mpv --title=PANENAME (uppercase).\n\
 \n\
 [music]\n\
-geometry = 366x366+0+0\n\
+swaymsg = [title=\"MUSIC\"] floating enable, resize set 366 366, move position 0 0\n\
 \n\
-[wide]\n\
-geometry = 650x366+374+0\n\
+[wide-top]\n\
+swaymsg = [title=\"WIDE-TOP\"] floating enable, resize set 650 366, move position 0 374\n\
 \n\
-[standard]\n\
-geometry = 650x488+1032+0\n";
-
-const LAYOUT_SPLIT: &str = "\
-# panebot layout — pb.split\n\
-# Split layout features a 16:9 editor pane with lua scripts to cut and export clips.\n\
-\n\
-[scope]\n\
-geometry = 926x386+0+68\n\
-\n\
-[wide-editor]\n\
-geometry = 790x568+2060+490\n\
+[wide-bottom]\n\
+swaymsg = [title=\"WIDE-BOTTOM\"] floating enable, resize set 650 366, move position 0 748\n\
 \n\
 [standard]\n\
-geometry = 2014x1074+6+482\n\
-\n\
-[wide]\n\
-geometry = 858x484+2038+1074\n";
+swaymsg = [title=\"STANDARD\"] floating enable, resize set 650 488, move position 0 1122\n";
 
+const LAYOUT_SWAY_RIGHT_STACK: &str = "\
+# panebot layout — pb.sway.right.stack\n\
+# Sway floating layout, right stack.\n\
+# Windows matched by mpv --title=PANENAME (uppercase).\n\
+\n\
+[music]\n\
+swaymsg = [title=\"MUSIC\"] floating enable, resize set 366 366, move position 2574 64\n\
+\n\
+[wide-top]\n\
+swaymsg = [title=\"WIDE-TOP\"] floating enable, resize set 650 366, move position 2290 432\n\
+\n\
+[wide-bottom]\n\
+swaymsg = [title=\"WIDE-BOTTOM\"] floating enable, resize set 650 366, move position 2290 804\n\
+\n\
+[standard]\n\
+swaymsg = [title=\"STANDARD\"] floating enable, resize set 650 488, move position 2290 1180\n";
 
 // ---------------------------------------------------------------------------
 // Logger
@@ -192,12 +204,12 @@ fn bootstrap(log: &mut Logger) -> std::io::Result<()> {
 
     let created = !panes_conf().exists();
 
-    write_if_missing(&panes_conf(),  DEFAULT_PANES_CONF)?;
-    write_if_missing(&types_conf(),  DEFAULT_TYPES_CONF)?;
-    write_if_missing(&layouts_dir().join("pb.left.stack.layout"),  LAYOUT_LEFT_STACK)?;
-    write_if_missing(&layouts_dir().join("pb.right.stack.layout"), LAYOUT_RIGHT_STACK)?;
-    write_if_missing(&layouts_dir().join("pb.top.row.layout"),     LAYOUT_TOP_ROW)?;
-    write_if_missing(&layouts_dir().join("pb.split.layout"),       LAYOUT_SPLIT)?;
+    write_if_missing(&panes_conf(), DEFAULT_PANES_CONF)?;
+    write_if_missing(&types_conf(), DEFAULT_TYPES_CONF)?;
+    write_if_missing(&layouts_dir().join("pb.left.stack.layout"),       LAYOUT_LEFT_STACK)?;
+    write_if_missing(&layouts_dir().join("pb.right.stack.layout"),      LAYOUT_RIGHT_STACK)?;
+    write_if_missing(&layouts_dir().join("pb.sway.left.stack.layout"),  LAYOUT_SWAY_LEFT_STACK)?;
+    write_if_missing(&layouts_dir().join("pb.sway.right.stack.layout"), LAYOUT_SWAY_RIGHT_STACK)?;
 
     if created {
         log.log("bootstrap :: created default config");
@@ -237,10 +249,6 @@ fn ensure_pane_files(pane: &Pane, types: &HashMap<String, PaneType>, log: &mut L
                 writeln!(f, "scripts-dir={}", pane_scripts(&pane.name).to_string_lossy())?;
             }
         }
-
-        // macOS: initial geometry written here when layout parser is implemented
-        // Linux/Sway: geometry not written — Sway rules handle placement via
-        //             window title matching on pane.name.to_uppercase()
     } else {
         log.log(&format!("ensure_pane :: {} :: mpv.conf exists", pane.name));
     }
@@ -255,11 +263,20 @@ fn ensure_pane_files(pane: &Pane, types: &HashMap<String, PaneType>, log: &mut L
 
 // ---------------------------------------------------------------------------
 // Layout parser
+//
+// Returns a map of pane name -> LayoutEntry.
+// Each entry carries whichever keys were present in the layout file.
 // ---------------------------------------------------------------------------
 
-fn parse_layout(content: &str) -> HashMap<String, String> {
-    let mut map      = HashMap::new();
-    let mut current  = String::new();
+#[derive(Debug, Clone, Default)]
+struct LayoutEntry {
+    geometry: Option<String>,
+    swaymsg:  Option<String>,
+}
+
+fn parse_layout(content: &str) -> HashMap<String, LayoutEntry> {
+    let mut map     = HashMap::new();
+    let mut current = String::new();
 
     for line in content.lines() {
         let line = line.trim();
@@ -267,15 +284,19 @@ fn parse_layout(content: &str) -> HashMap<String, String> {
 
         if line.starts_with('[') && line.ends_with(']') {
             current = line[1..line.len()-1].to_string();
+            map.entry(current.clone()).or_insert_with(LayoutEntry::default);
             continue;
         }
 
         if !current.is_empty() {
             if let Some(eq) = line.find('=') {
-                let key = line[..eq].trim();
-                let val = line[eq+1..].trim().to_string();
-                if key == "geometry" {
-                    map.insert(current.clone(), val);
+                let key   = line[..eq].trim();
+                let val   = line[eq+1..].trim().to_string();
+                let entry = map.entry(current.clone()).or_insert_with(LayoutEntry::default);
+                match key {
+                    "geometry" => entry.geometry = Some(val),
+                    "swaymsg"  => entry.swaymsg  = Some(val),
+                    _          => {}
                 }
             }
         }
@@ -284,7 +305,7 @@ fn parse_layout(content: &str) -> HashMap<String, String> {
     map
 }
 
-fn load_layout(name: &str, log: &mut Logger) -> Option<HashMap<String, String>> {
+fn load_layout(name: &str, log: &mut Logger) -> Option<HashMap<String, LayoutEntry>> {
     let path = layouts_dir().join(format!("{}.layout", name));
     match std::fs::read_to_string(&path) {
         Ok(content) => {
@@ -299,47 +320,15 @@ fn load_layout(name: &str, log: &mut Logger) -> Option<HashMap<String, String>> 
     }
 }
 
-fn apply_layout(layout_map: &HashMap<String, String>, panes: &[Pane], log: &mut Logger) {
-    for pane in panes {
-        if let Some(geo) = layout_map.get(&pane.name) {
-            if cfg!(target_os = "macos") {
-                apply_geometry_macos(&pane.name, geo, log);
-            } else {
-                log.log(&format!("layout :: {} :: skipping geometry on linux (Sway handles placement)", pane.name));
-            }
-        } else {
-            log.log(&format!("layout :: no entry for pane {}", pane.name));
-        }
-    }
-}
-
-// On macOS: write geometry to mpv.conf and restart the pane.
-// mpv respects --geometry=WxH+X+Y at launch.
-fn apply_geometry_macos(pane_name: &str, geometry: &str, log: &mut Logger) {
-    let mpv_conf = pane_mpv_conf(pane_name);
-
-    // Read existing conf, replace or append geometry line
-    let content = std::fs::read_to_string(&mpv_conf).unwrap_or_default();
-    let mut lines: Vec<String> = content.lines()
-        .filter(|l| !l.trim().starts_with("geometry="))
-        .map(|l| l.to_string())
-        .collect();
-    lines.push(format!("geometry={}", geometry));
-
-    if let Err(e) = std::fs::write(&mpv_conf, lines.join("\n") + "\n") {
-        log.log(&format!("layout.macos :: {} :: failed to write mpv.conf: {}", pane_name, e));
-        return;
-    }
-
-    log.log(&format!("layout.macos :: {} :: geometry={}", pane_name, geometry));
-    // Pane will pick up geometry on next restart — caller handles restart if needed
-}
-
 // ---------------------------------------------------------------------------
 // Launch / kill mpv
+//
+// geometry: passed as --geometry=WxH+X+Y on macOS only, at launch time.
+//           Never written to mpv.conf — mpv.conf is static user config.
+//           Ignored on Linux — Sway positions via swaymsg after launch.
 // ---------------------------------------------------------------------------
 
-fn launch_pane(pane: &Pane, log: &mut Logger) {
+fn launch_pane(pane: &Pane, geometry: Option<&str>, log: &mut Logger) {
     let socket   = pane_socket(&pane.name);
     let mpv_conf = pane_mpv_conf(&pane.name);
     let playlist = pane_playlist(&pane.name);
@@ -352,6 +341,12 @@ fn launch_pane(pane: &Pane, log: &mut Logger) {
         "--mute=yes".to_string(),
         "--pause=yes".to_string(),
     ];
+
+    #[cfg(target_os = "macos")]
+    if let Some(geo) = geometry {
+        args.push(format!("--geometry={}", geo));
+        log.log(&format!("launch :: {} :: geometry={}", pane.name, geo));
+    }
 
     if playlist.exists() && playlist.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         args.push(playlist.to_string_lossy().to_string());
@@ -369,6 +364,22 @@ fn launch_pane(pane: &Pane, log: &mut Logger) {
     {
         Ok(_)  => log.log(&format!("launch :: {} :: mpv spawned", pane.name)),
         Err(e) => log.log(&format!("launch :: {} :: failed to spawn mpv: {}", pane.name, e)),
+    }
+}
+
+// On Linux/Sway: execute swaymsg to position the window after launch.
+#[cfg(target_os = "linux")]
+fn apply_swaymsg(pane_name: &str, msg: &str, log: &mut Logger) {
+    match std::process::Command::new("swaymsg").arg(msg).output() {
+        Ok(out) => {
+            if out.status.success() {
+                log.log(&format!("sway :: {} :: positioned", pane_name));
+            } else {
+                let err = String::from_utf8_lossy(&out.stderr);
+                log.log(&format!("sway :: {} :: swaymsg failed: {}", pane_name, err.trim()));
+            }
+        }
+        Err(e) => log.log(&format!("sway :: {} :: could not run swaymsg: {}", pane_name, e)),
     }
 }
 
@@ -536,12 +547,12 @@ async fn monitor_pane(
                         .or_insert_with(|| PaneState::new(&pane_name, &pane_type));
 
                     match prop.as_str() {
-                        "pause"        => { ps.paused      = v["data"].as_bool().unwrap_or(true); }
-                        "volume"       => { ps.volume       = v["data"].as_f64().unwrap_or(0.0); }
-                        "media-title"  => { ps.title        = v["data"].as_str().unwrap_or("").to_string(); }
-                        "playlist-pos" => { ps.playlist_pos = v["data"].as_i64().unwrap_or(-1); }
-                        "mute"         => { ps.muted        = v["data"].as_bool().unwrap_or(false); }
-                        "idle-active"  => { ps.idle_active  = v["data"].as_bool().unwrap_or(true); }
+                        "pause"        => { ps.paused       = v["data"].as_bool().unwrap_or(true); }
+                        "volume"       => { ps.volume        = v["data"].as_f64().unwrap_or(0.0); }
+                        "media-title"  => { ps.title         = v["data"].as_str().unwrap_or("").to_string(); }
+                        "playlist-pos" => { ps.playlist_pos  = v["data"].as_i64().unwrap_or(-1); }
+                        "mute"         => { ps.muted         = v["data"].as_bool().unwrap_or(false); }
+                        "idle-active"  => { ps.idle_active   = v["data"].as_bool().unwrap_or(true); }
                         _ => continue,
                     }
 
@@ -700,7 +711,6 @@ async fn handle_command(
         "keypress"           |
         "keydown"            |
         "keyup"
-        // "show-text" -- OSD, enable when needed
     );
 
     if !allowed { return; }
@@ -769,7 +779,7 @@ async fn handle_node_command(
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
             for pane in panes.iter() {
-                launch_pane(pane, &mut log);
+                launch_pane(pane, None, &mut log);
             }
             let _ = tx.send(serde_json::json!({"event":"node:restart-all"}).to_string());
         }
@@ -780,7 +790,7 @@ async fn handle_node_command(
                 let mut log = Logger::open().unwrap();
                 kill_pane_async(&pane.name, &mut log).await;
                 tokio::time::sleep(Duration::from_millis(3000)).await;
-                launch_pane(pane, &mut log);
+                launch_pane(pane, None, &mut log);
                 let _ = tx.send(serde_json::json!({
                     "event": "node:restart-pane",
                     "pane":  pane_name,
@@ -852,17 +862,15 @@ async fn handle_node_command(
             let layout_name = match v["layout_name"].as_str() { Some(n) => n.to_string(), None => return };
             let mut log = Logger::open().unwrap();
             if let Some(layout_map) = load_layout(&layout_name, &mut log) {
-                apply_layout(&layout_map, panes, &mut log);
 
-                // Snapshot state before killing so we can restore after relaunch
-                let snapshots: Vec<(String, f64, bool, bool)> = {
+                // Snapshot volume and mute before killing
+                let snapshots: Vec<(String, f64, bool)> = {
                     let s = state.lock().unwrap();
                     panes.iter().map(|pane| {
-                        let ps = s.get(&pane.name);
+                        let ps     = s.get(&pane.name);
                         let volume = ps.map(|p| p.volume).unwrap_or(100.0);
                         let muted  = ps.map(|p| p.muted).unwrap_or(false);
-                        let paused = ps.map(|p| p.paused).unwrap_or(true);
-                        (pane.name.clone(), volume, muted, paused)
+                        (pane.name.clone(), volume, muted)
                     }).collect()
                 };
 
@@ -871,12 +879,28 @@ async fn handle_node_command(
                     kill_pane_async(&pane.name, &mut log).await;
                 }
 
+                // Launch with geometry from new layout (macOS only)
                 for pane in panes.iter() {
-                    launch_pane(pane, &mut log);
+                    let geo = layout_map.get(&pane.name)
+                        .and_then(|e| e.geometry.as_deref());
+                    launch_pane(pane, geo, &mut log);
                 }
 
-                // Poll each pane socket until alive (max 5s), then restore state
-                for (pane_name, volume, muted, _paused) in &snapshots {
+                // On Linux/Sway: position windows after a brief settle
+                #[cfg(target_os = "linux")]
+                {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    for pane in panes.iter() {
+                        if let Some(entry) = layout_map.get(&pane.name) {
+                            if let Some(msg) = &entry.swaymsg {
+                                apply_swaymsg(&pane.name, msg, &mut log);
+                            }
+                        }
+                    }
+                }
+
+                // Poll each socket until alive (max 5s), then restore volume/mute
+                for (pane_name, volume, muted) in &snapshots {
                     let socket = pane_socket(pane_name).to_string_lossy().to_string();
                     let mut alive = false;
                     for _ in 0..50 {
@@ -982,28 +1006,36 @@ async fn main() {
         }
     }
 
+    // Load layout first so geometry is available at launch time
+    let layout_map = load_layout(&cfg.layout, &mut log);
+
+    // Launch only panes that are not already running
+    let mut freshly_launched: Vec<String> = Vec::new();
     for pane in &cfg.panes {
         let socket = pane_socket(&pane.name).to_string_lossy().to_string();
         if socket_alive(&socket).await {
             log.log(&format!("launch :: {} :: already running", pane.name));
         } else {
-            launch_pane(pane, &mut log);
+            let geo = layout_map.as_ref()
+                .and_then(|m| m.get(&pane.name))
+                .and_then(|e| e.geometry.as_deref());
+            launch_pane(pane, geo, &mut log);
+            freshly_launched.push(pane.name.clone());
         }
     }
 
-    // Apply layout — writes geometry to mpv.conf on macOS and restarts panes.
-    // On Linux geometry is skipped; Sway handles placement via window title.
-    // On macOS only restart panes that were freshly spawned — never touch
-    // already-running panes on daemon restart.
-    if let Some(layout_map) = load_layout(&cfg.layout, &mut log) {
-        apply_layout(&layout_map, &cfg.panes, &mut log);
-        if cfg!(target_os = "macos") {
+    // On Linux/Sway: position freshly launched panes via swaymsg
+    #[cfg(target_os = "linux")]
+    if let Some(ref lmap) = layout_map {
+        if !freshly_launched.is_empty() {
+            tokio::time::sleep(Duration::from_millis(500)).await;
             for pane in &cfg.panes {
-                let socket = pane_socket(&pane.name).to_string_lossy().to_string();
-                if layout_map.contains_key(&pane.name) && !socket_alive(&socket).await {
-                    kill_pane_async(&pane.name, &mut log).await;
-                    tokio::time::sleep(Duration::from_millis(300)).await;
-                    launch_pane(pane, &mut log);
+                if freshly_launched.contains(&pane.name) {
+                    if let Some(entry) = lmap.get(&pane.name) {
+                        if let Some(msg) = &entry.swaymsg {
+                            apply_swaymsg(&pane.name, msg, &mut log);
+                        }
+                    }
                 }
             }
         }

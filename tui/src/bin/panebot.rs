@@ -259,8 +259,8 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
             app.layouts  = vec![
                 "pb.left.stack".to_string(),
                 "pb.right.stack".to_string(),
-                "pb.top.row".to_string(),
-                "pb.split".to_string(),
+                "pb.sway.left.stack".to_string(),
+                "pb.sway.right.stack".to_string(),
             ];
 
             if let Some(panes) = v["panes"].as_array() {
