@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::io;
 use std::path::PathBuf;
 
 // ---------------------------------------------------------------------------
@@ -183,4 +184,112 @@ pub fn load_types() -> HashMap<String, PaneType> {
     flush!();
 
     types
+}
+
+// ---------------------------------------------------------------------------
+// M3U helpers
+//
+// All playlist operations go through these functions.
+// The .m3u file is the source of truth — mpv is reloaded after every write.
+// ---------------------------------------------------------------------------
+
+// Recursively walk a directory, returning all file paths sorted.
+pub fn walk_dir(dir: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let path = PathBuf::from(dir.trim_end_matches('/'));
+    if let Ok(entries) = std::fs::read_dir(&path) {
+        let mut children: Vec<_> = entries.filter_map(|e| e.ok()).collect();
+        children.sort_by_key(|e| e.file_name());
+        for entry in children {
+            let p = entry.path();
+            if p.is_dir() {
+                let sub = p.to_string_lossy().to_string() + "/";
+                results.extend(walk_dir(&sub));
+            } else {
+                results.push(p.to_string_lossy().to_string());
+            }
+        }
+    }
+    results
+}
+
+// Read .m3u — returns only non-empty, non-comment lines.
+// Directory entries (trailing /) are expanded recursively and written back.
+pub fn read_m3u(pane_name: &str) -> Vec<String> {
+    let path = pane_playlist(pane_name);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c)  => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let raw: Vec<String> = content.lines()
+        .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with('#') })
+        .map(|l| l.trim().to_string())
+        .collect();
+
+    let mut expanded = Vec::new();
+    let mut dirty    = false;
+    for entry in &raw {
+        if entry.ends_with('/') {
+            expanded.extend(walk_dir(entry));
+            dirty = true;
+        } else {
+            expanded.push(entry.clone());
+        }
+    }
+
+    if dirty {
+        let _ = write_m3u(pane_name, &expanded);
+    }
+
+    expanded
+}
+
+// Write items back to .m3u, preserving the #EXTM3U header.
+pub fn write_m3u(pane_name: &str, items: &[String]) -> io::Result<()> {
+    let path = pane_playlist(pane_name);
+    let mut out = String::from("#EXTM3U\n");
+    for item in items {
+        out.push_str(item);
+        out.push('\n');
+    }
+    std::fs::write(&path, out)
+}
+
+// Append one entry, returns the updated list.
+pub fn m3u_append(pane_name: &str, entry: &str) -> io::Result<Vec<String>> {
+    let mut items = read_m3u(pane_name);
+    items.push(entry.trim().to_string());
+    write_m3u(pane_name, &items)?;
+    Ok(items)
+}
+
+// Remove entry at index. Refuses if it is the currently-playing position.
+// Returns Ok(Some(items)) on success, Ok(None) if blocked (playing item).
+pub fn m3u_remove(pane_name: &str, idx: usize, current_pos: i64) -> io::Result<Option<Vec<String>>> {
+    if current_pos >= 0 && current_pos as usize == idx {
+        return Ok(None);
+    }
+    let mut items = read_m3u(pane_name);
+    if idx < items.len() {
+        items.remove(idx);
+        write_m3u(pane_name, &items)?;
+    }
+    Ok(Some(items))
+}
+
+// Crop: keep only the currently-playing item.
+// Returns Ok(None) if nothing is playing.
+pub fn m3u_crop(pane_name: &str, current_pos: i64) -> io::Result<Option<Vec<String>>> {
+    if current_pos < 0 {
+        return Ok(None);
+    }
+    let items = read_m3u(pane_name);
+    let idx = current_pos as usize;
+    if idx >= items.len() {
+        return Ok(None);
+    }
+    let kept = vec![items[idx].clone()];
+    write_m3u(pane_name, &kept)?;
+    Ok(Some(kept))
 }

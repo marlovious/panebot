@@ -11,12 +11,23 @@ use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 
-use panebot::{
+use panebot_lib::{
     load_config, load_types,
     config_dir, layouts_dir, panes_conf, types_conf, scripts_lib,
     pane_dir, pane_mpv_conf, pane_playlist, pane_scripts, pane_socket,
     Pane, PaneType,
 };
+
+// ---------------------------------------------------------------------------
+// Timing constants
+// ---------------------------------------------------------------------------
+
+const MONITOR_RETRY_MS:    u64 = 500;  // delay between socket alive checks
+const MONITOR_CONNECT_MS:  u64 = 200;  // delay on failed IPC connect
+const SWAY_SETTLE_MS:      u64 = 500;  // wait for mpv window before swaymsg
+const SOCKET_POLL_MS:      u64 = 100;  // poll interval waiting for socket after launch
+const SOCKET_POLL_RETRIES: u32 = 50;   // max retries = 5s total
+const RESTART_PANE_WAIT_MS: u64 = 3000; // wait after kill before relaunch on single pane restart
 
 // ---------------------------------------------------------------------------
 // Default file contents
@@ -367,7 +378,6 @@ fn launch_pane(pane: &Pane, geometry: Option<&str>, log: &mut Logger) {
     }
 }
 
-// On Linux/Sway: execute swaymsg to position the window after launch.
 #[cfg(target_os = "linux")]
 fn apply_swaymsg(pane_name: &str, msg: &str, log: &mut Logger) {
     match std::process::Command::new("swaymsg").arg(msg).output() {
@@ -394,6 +404,36 @@ async fn kill_pane_async(pane_name: &str, log: &mut Logger) {
         Err(_) => {
             log.log(&format!("kill :: {} :: socket not found, already dead", pane_name));
         }
+    }
+}
+
+// Poll a pane's socket until alive, then restore volume/mute/pause state.
+async fn restore_pane_state(
+    pane_name: &str,
+    volume:    f64,
+    muted:     bool,
+    cmds:      &PaneCommands,
+    log:       &mut Logger,
+) {
+    let socket = pane_socket(pane_name).to_string_lossy().to_string();
+    let mut alive = false;
+    for _ in 0..SOCKET_POLL_RETRIES {
+        tokio::time::sleep(Duration::from_millis(SOCKET_POLL_MS)).await;
+        if socket_alive(&socket).await {
+            alive = true;
+            break;
+        }
+    }
+    if alive {
+        let sender = cmds.lock().unwrap().get(pane_name).cloned();
+        if let Some(s) = sender {
+            let _ = s.send(serde_json::json!({"command":["set_property","volume",volume]}).to_string()).await;
+            let _ = s.send(serde_json::json!({"command":["set_property","mute",muted]}).to_string()).await;
+            let _ = s.send(serde_json::json!({"command":["set_property","pause",true]}).to_string()).await;
+            log.log(&format!("layout :: {} :: state restored (vol={:.0} mute={})", pane_name, volume, muted));
+        }
+    } else {
+        log.log(&format!("layout :: {} :: socket did not come up in time", pane_name));
     }
 }
 
@@ -471,13 +511,16 @@ async fn monitor_pane(
                     }).to_string());
                 }
             }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(MONITOR_RETRY_MS)).await;
             continue;
         }
 
         let stream = match UnixStream::connect(&socket_path).await {
             Ok(s)  => s,
-            Err(_) => { tokio::time::sleep(Duration::from_millis(200)).await; continue; }
+            Err(_) => {
+                tokio::time::sleep(Duration::from_millis(MONITOR_CONNECT_MS)).await;
+                continue;
+            }
         };
 
         // Fresh channel on each reconnect — fixes consumed cmd_rx bug
@@ -506,7 +549,7 @@ async fn monitor_pane(
             }
         }
         if !sub_ok {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(MONITOR_CONNECT_MS)).await;
             continue;
         }
 
@@ -592,7 +635,7 @@ async fn monitor_pane(
             }).to_string());
         }
 
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(MONITOR_RETRY_MS)).await;
     }
 }
 
@@ -777,7 +820,7 @@ async fn handle_node_command(
             for pane in panes.iter() {
                 kill_pane_async(&pane.name, &mut log).await;
             }
-            tokio::time::sleep(Duration::from_millis(300)).await;
+            tokio::time::sleep(Duration::from_millis(MONITOR_RETRY_MS)).await;
             for pane in panes.iter() {
                 launch_pane(pane, None, &mut log);
             }
@@ -789,7 +832,7 @@ async fn handle_node_command(
             if let Some(pane) = panes.iter().find(|p| p.name == pane_name) {
                 let mut log = Logger::open().unwrap();
                 kill_pane_async(&pane.name, &mut log).await;
-                tokio::time::sleep(Duration::from_millis(3000)).await;
+                tokio::time::sleep(Duration::from_millis(RESTART_PANE_WAIT_MS)).await;
                 launch_pane(pane, None, &mut log);
                 let _ = tx.send(serde_json::json!({
                     "event": "node:restart-pane",
@@ -889,7 +932,7 @@ async fn handle_node_command(
                 // On Linux/Sway: position windows after a brief settle
                 #[cfg(target_os = "linux")]
                 {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    tokio::time::sleep(Duration::from_millis(SWAY_SETTLE_MS)).await;
                     for pane in panes.iter() {
                         if let Some(entry) = layout_map.get(&pane.name) {
                             if let Some(msg) = &entry.swaymsg {
@@ -899,28 +942,9 @@ async fn handle_node_command(
                     }
                 }
 
-                // Poll each socket until alive (max 5s), then restore volume/mute
+                // Restore volume/mute/pause for each pane
                 for (pane_name, volume, muted) in &snapshots {
-                    let socket = pane_socket(pane_name).to_string_lossy().to_string();
-                    let mut alive = false;
-                    for _ in 0..50 {
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                        if socket_alive(&socket).await {
-                            alive = true;
-                            break;
-                        }
-                    }
-                    if alive {
-                        let sender = cmds.lock().unwrap().get(pane_name).cloned();
-                        if let Some(s) = sender {
-                            let _ = s.send(serde_json::json!({"command":["set_property","volume",volume]}).to_string()).await;
-                            let _ = s.send(serde_json::json!({"command":["set_property","mute",muted]}).to_string()).await;
-                            let _ = s.send(serde_json::json!({"command":["set_property","pause",true]}).to_string()).await;
-                            log.log(&format!("layout :: {} :: state restored (vol={:.0} mute={})", pane_name, volume, muted));
-                        }
-                    } else {
-                        log.log(&format!("layout :: {} :: socket did not come up in time", pane_name));
-                    }
+                    restore_pane_state(pane_name, *volume, *muted, cmds, &mut log).await;
                 }
 
                 let _ = tx.send(serde_json::json!({
@@ -944,7 +968,7 @@ async fn handle_node_command(
                 "event":  "node:down",
                 "reason": "admin"
             }).to_string());
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            tokio::time::sleep(Duration::from_millis(MONITOR_CONNECT_MS)).await;
             shutdown.notify_one();
         }
 
@@ -1028,7 +1052,7 @@ async fn main() {
     #[cfg(target_os = "linux")]
     if let Some(ref lmap) = layout_map {
         if !freshly_launched.is_empty() {
-            tokio::time::sleep(Duration::from_millis(500)).await;
+            tokio::time::sleep(Duration::from_millis(SWAY_SETTLE_MS)).await;
             for pane in &cfg.panes {
                 if freshly_launched.contains(&pane.name) {
                     if let Some(entry) = lmap.get(&pane.name) {

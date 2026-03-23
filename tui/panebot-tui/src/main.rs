@@ -14,15 +14,18 @@ use ratatui::{
 };
 use std::collections::{HashMap, VecDeque};
 use std::io;
-use std::path::PathBuf;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
+
+use panebot_lib::{
+    pane_playlist, read_m3u, write_m3u, m3u_append, m3u_remove, m3u_crop,
+};
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const DAEMON_ADDR: &str  = "ws://127.0.0.1:9090";
+const DAEMON_ADDR: &str   = "ws://127.0.0.1:9090";
 const LOG_CAPACITY: usize = 500;
 
 // ---------------------------------------------------------------------------
@@ -51,6 +54,7 @@ type WsSink = futures_util::stream::SplitSink<
 
 // ---------------------------------------------------------------------------
 // Pane state — mirrors PaneState in daemon
+// Note: kept separate from daemon's PaneState as TUI does not need Serialize.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -103,9 +107,9 @@ impl PaneState {
 enum DetailsMode {
     Normal,
     Command,
-    Jump,    // typing a number to jump to
-    Add,     // typing a path to add
-    Send,    // pane picker overlay for S
+    Jump,
+    Add,
+    Send,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,34 +122,26 @@ struct LogLine {
 }
 
 struct App {
-    pane_order:    Vec<String>,
-    panes:         HashMap<String, PaneState>,
-    selected:      usize,
-    hostname:      String,
-    layout:        String,
-    log:           VecDeque<LogLine>,
-    show_log:      bool,
-    command_mode:  bool,         // dashboard CMD mode
-    show_picker:   bool,         // layout picker overlay
-    picker_sel:    usize,
-    layouts:       Vec<String>,
-
-    // Details screen
-    show_details:   bool,
-    details_mode:   DetailsMode,
-    playlist_sel:   usize,
-    playlist_items: Vec<String>,  // raw paths from .m3u
-    status_msg:     Option<String>, // transient footer message (errors/blocks)
-
-    // Jump mode input
-    jump_input:     String,
-
-    // Add mode input + completion cache
-    add_input:      String,
+    pane_order:      Vec<String>,
+    panes:           HashMap<String, PaneState>,
+    selected:        usize,
+    hostname:        String,
+    layout:          String,
+    log:             VecDeque<LogLine>,
+    show_log:        bool,
+    command_mode:    bool,
+    show_picker:     bool,
+    picker_sel:      usize,
+    layouts:         Vec<String>,
+    show_details:    bool,
+    details_mode:    DetailsMode,
+    playlist_sel:    usize,
+    playlist_items:  Vec<String>,
+    status_msg:      Option<String>,
+    jump_input:      String,
+    add_input:       String,
     add_completions: Vec<String>,
-    add_comp_sel:   usize,
-
-    // Send picker
+    add_comp_sel:    usize,
     send_picker_sel: usize,
 }
 
@@ -201,7 +197,6 @@ impl App {
         }
     }
 
-    // Current playlist position for the selected pane (-1 if unknown)
     fn current_playlist_pos(&self) -> i64 {
         self.selected_name()
             .and_then(|n| self.panes.get(&n))
@@ -209,7 +204,6 @@ impl App {
             .unwrap_or(-1)
     }
 
-    // True if selected playlist item is currently playing
     fn sel_is_playing(&self) -> bool {
         let pos = self.current_playlist_pos();
         pos >= 0 && pos as usize == self.playlist_sel
@@ -222,10 +216,10 @@ impl App {
 
 fn log_event(app: &mut App, pane: &str, spans: Vec<(String, Color)>) {
     let mut line = vec![
-        ("[PaneBot]".to_string(),                        C_ORANGE),
-        (" :: ".to_string(),                             C_DIM),
-        (format!("{:<12}", pane.to_uppercase()),         C_WHITE),
-        (" :: ".to_string(),                             C_DIM),
+        ("[PaneBot]".to_string(),                C_ORANGE),
+        (" :: ".to_string(),                     C_DIM),
+        (format!("{:<12}", pane.to_uppercase()), C_WHITE),
+        (" :: ".to_string(),                     C_DIM),
     ];
     line.extend(spans);
     app.push_log(line);
@@ -255,7 +249,6 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
         "bootstrap_complete" => {
             app.hostname = v["hostname"].as_str().unwrap_or("").to_string();
             app.layout   = v["layout"].as_str().unwrap_or("").to_string();
-            // Seed known layouts — hardcoded for now, could come from daemon later
             app.layouts  = vec![
                 "pb.left.stack".to_string(),
                 "pb.right.stack".to_string(),
@@ -405,10 +398,8 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
 fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
     terminal.draw(|f| {
-        let size        = f.size();
-        let _pane_count = app.pane_order.len().max(1) as u16;
+        let size = f.size();
 
-        // Fixed layout: header | div | content | div | footer
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -420,7 +411,6 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
             ])
             .split(size);
 
-        // -- Header --
         f.render_widget(Paragraph::new(Line::from(vec![
             Span::styled("[PaneBot]", Style::default().fg(C_ORANGE)),
             Span::styled(" :: ",     Style::default().fg(C_DIM)),
@@ -437,10 +427,8 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
             Span::styled(app.hostname.clone(), Style::default().fg(C_DIM)),
         ])), chunks[0]);
 
-        // -- Divider --
         f.render_widget(divider(size.width as usize), chunks[1]);
 
-        // -- Content: log view or pane rows --
         if app.show_log {
             let log_height = chunks[2].height as usize;
             let log_items: Vec<ListItem> = app.log.iter()
@@ -507,7 +495,6 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
             f.render_widget(List::new(items), chunks[2]);
         }
 
-        // -- Layout picker overlay --
         if app.show_picker {
             let picker_items: Vec<ListItem> = app.layouts.iter().enumerate().map(|(i, name)| {
                 let is_sel = i == app.picker_sel;
@@ -544,10 +531,8 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
             );
         }
 
-        // -- Divider --
         f.render_widget(divider(size.width as usize), chunks[3]);
 
-        // -- Footer --
         let footer = if app.command_mode {
             Line::from(vec![
                 Span::styled("[CMD]",     Style::default().add_modifier(Modifier::BOLD)),
@@ -647,15 +632,14 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(1),  // header
-                Constraint::Length(1),  // divider
-                Constraint::Min(1),     // list
-                Constraint::Length(1),  // divider
-                Constraint::Length(1),  // footer
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
             ])
             .split(size);
 
-        // -- Header — same style as dashboard --
         let sep = Span::styled(" :: ", Style::default().fg(C_DIM));
         let (pb_label, pb_color) = ps.map(|p| p.playback_label()).unwrap_or(("Offline", C_RED));
         let (vol_str, vol_color) = ps.map(|p| p.volume_label()).unwrap_or_else(|| ("Offline".to_string(), C_RED));
@@ -673,19 +657,13 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             sep.clone(),
             Span::styled(format!("[{:8}]", vol_str), Style::default().fg(vol_color)),
             sep.clone(),
-            Span::styled(
-                format!("{} items", app.playlist_items.len()),
-                Style::default().fg(C_DIM),
-            ),
+            Span::styled(format!("{} items", app.playlist_items.len()), Style::default().fg(C_DIM)),
         ])), chunks[0]);
 
-        // -- Divider --
         f.render_widget(divider(size.width as usize), chunks[1]);
 
-        // -- Playlist list --
         let list_height = chunks[2].height as usize;
-        // Scroll so selected item stays visible
-        let scroll_off = if app.playlist_sel >= list_height {
+        let scroll_off  = if app.playlist_sel >= list_height {
             app.playlist_sel + 1 - list_height
         } else {
             0
@@ -697,8 +675,10 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             .map(|(i, entry)| {
                 let is_current = i as i64 == current_pos;
                 let is_sel     = i == app.playlist_sel;
-
-                let display_str = { let t = entry.trim_end_matches('/'); t.split('/').last().unwrap_or(entry.as_str()).to_string() }; let display = display_str.as_str();
+                let display    = {
+                    let t = entry.trim_end_matches('/');
+                    t.split('/').last().unwrap_or(entry.as_str())
+                };
 
                 let cursor = if is_sel {
                     Span::styled(">> ", Style::default().fg(C_ORANGE))
@@ -728,7 +708,6 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
 
         f.render_widget(List::new(items), chunks[2]);
 
-        // -- Send pane picker overlay --
         if app.details_mode == DetailsMode::Send {
             let other_panes: Vec<&String> = app.pane_order.iter()
                 .filter(|n| Some(*n) != app.selected_name().as_ref())
@@ -763,10 +742,8 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             );
         }
 
-        // -- Divider --
         f.render_widget(divider(size.width as usize), chunks[3]);
 
-        // -- Footer --
         let footer = match &app.details_mode {
 
             DetailsMode::Jump => Line::from(vec![
@@ -799,7 +776,6 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             ]),
 
             DetailsMode::Command => {
-                // Status message overrides hints if set
                 if let Some(msg) = &app.status_msg {
                     Line::from(vec![
                         Span::styled(msg.clone(), Style::default().fg(C_RED).add_modifier(Modifier::BOLD)),
@@ -833,7 +809,7 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                         Span::styled("[up/dn]", Style::default().fg(C_DIM)),
                         Span::styled(" Select", Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[j]",     Style::default().fg(C_DIM)),
+                        Span::styled("[g]",     Style::default().fg(C_DIM)),
                         Span::styled(" Jump",   Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
                         Span::styled("[J]",     Style::default().fg(C_DIM)),
@@ -875,138 +851,9 @@ fn divider(width: usize) -> Paragraph<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Playlist helpers — all operate on the .m3u file directly
-// ---------------------------------------------------------------------------
-
-// Resolve config dir the same way lib.rs does, without importing it.
-// The TUI binary does not link lib.rs directly.
-fn config_dir() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    if let Ok(xdg) = std::env::var("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("panebot");
-        }
-    }
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join(".config/panebot")
-}
-
-fn pane_playlist_path(pane_name: &str) -> PathBuf {
-    config_dir()
-        .join(pane_name.to_lowercase())
-        .join(format!("{}.m3u", pane_name.to_lowercase()))
-}
-
-// Recursively walk a directory, returning all file paths sorted.
-fn walk_dir(dir: &str) -> Vec<String> {
-    let mut results = Vec::new();
-    let path = PathBuf::from(dir.trim_end_matches('/'));
-    if let Ok(entries) = std::fs::read_dir(&path) {
-        let mut children: Vec<_> = entries.filter_map(|e| e.ok()).collect();
-        children.sort_by_key(|e| e.file_name());
-        for entry in children {
-            let p = entry.path();
-            if p.is_dir() {
-                let sub = p.to_string_lossy().to_string() + "/";
-                results.extend(walk_dir(&sub));
-            } else {
-                results.push(p.to_string_lossy().to_string());
-            }
-        }
-    }
-    results
-}
-
-// Read .m3u — returns only non-empty, non-comment lines.
-// Directory entries (trailing /) are expanded recursively and written back.
-fn read_m3u(pane_name: &str) -> Vec<String> {
-    let path = pane_playlist_path(pane_name);
-    let content = match std::fs::read_to_string(&path) {
-        Ok(c)  => c,
-        Err(_) => return Vec::new(),
-    };
-
-    let raw: Vec<String> = content.lines()
-        .filter(|l| { let t = l.trim(); !t.is_empty() && !t.starts_with('#') })
-        .map(|l| l.trim().to_string())
-        .collect();
-
-    let mut expanded = Vec::new();
-    let mut dirty    = false;
-    for entry in &raw {
-        if entry.ends_with('/') {
-            expanded.extend(walk_dir(entry));
-            dirty = true;
-        } else {
-            expanded.push(entry.clone());
-        }
-    }
-
-    if dirty {
-        let _ = write_m3u(pane_name, &expanded);
-    }
-
-    expanded
-}
-
-// Write items back to .m3u, preserving the #EXTM3U header.
-fn write_m3u(pane_name: &str, items: &[String]) -> io::Result<()> {
-    let path = pane_playlist_path(pane_name);
-    let mut out = String::from("#EXTM3U\n");
-    for item in items {
-        out.push_str(item);
-        out.push('\n');
-    }
-    std::fs::write(&path, out)
-}
-
-// Append one entry, returns the updated list.
-fn m3u_append(pane_name: &str, entry: &str) -> io::Result<Vec<String>> {
-    let mut items = read_m3u(pane_name);
-    items.push(entry.trim().to_string());
-    write_m3u(pane_name, &items)?;
-    Ok(items)
-}
-
-// Remove entry at index. Refuses if it is the currently-playing position.
-// Returns Ok(Some(items)) on success, Ok(None) if blocked (playing item).
-fn m3u_remove(pane_name: &str, idx: usize, current_pos: i64) -> io::Result<Option<Vec<String>>> {
-    if current_pos >= 0 && current_pos as usize == idx {
-        return Ok(None); // blocked
-    }
-    let mut items = read_m3u(pane_name);
-    if idx < items.len() {
-        items.remove(idx);
-        write_m3u(pane_name, &items)?;
-    }
-    Ok(Some(items))
-}
-
-// Crop: keep only the currently-playing item (by current_pos).
-// If nothing is playing (current_pos < 0) this is a no-op.
-fn m3u_crop(pane_name: &str, current_pos: i64) -> io::Result<Option<Vec<String>>> {
-    if current_pos < 0 {
-        return Ok(None); // nothing playing, refuse
-    }
-    let items = read_m3u(pane_name);
-    let idx = current_pos as usize;
-    if idx >= items.len() {
-        return Ok(None);
-    }
-    let kept = vec![items[idx].clone()];
-    write_m3u(pane_name, &kept)?;
-    Ok(Some(kept))
-}
-
-// ---------------------------------------------------------------------------
 // Path completion for add mode
 // ---------------------------------------------------------------------------
 
-// Build completions for the current input string.
-// Expands ~ and lists directory contents that start with the typed prefix.
-// For recursive expansion: if input ends with '/' we list that directory.
 fn build_completions(input: &str) -> Vec<String> {
     let expanded = if input.starts_with('~') {
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
@@ -1015,7 +862,6 @@ fn build_completions(input: &str) -> Vec<String> {
         input.to_string()
     };
 
-    // Split into dir + prefix
     let (dir, prefix) = if expanded.ends_with('/') {
         (expanded.as_str(), "")
     } else {
@@ -1037,7 +883,6 @@ fn build_completions(input: &str) -> Vec<String> {
             if !name.starts_with(prefix) { return None; }
             let mut full = format!("{}{}", dir, name);
             if e.path().is_dir() { full.push('/'); }
-            // Re-collapse home dir back to ~
             let home = std::env::var("HOME").unwrap_or_default();
             if !home.is_empty() && full.starts_with(&home) {
                 full = full.replacen(&home, "~", 1);
@@ -1047,17 +892,6 @@ fn build_completions(input: &str) -> Vec<String> {
         .collect();
 
     results.sort();
-
-    // For media files filter to common extensions + dirs
-    results.retain(|r| {
-        r.ends_with('/') ||
-        r.ends_with(".mp4") || r.ends_with(".mkv") || r.ends_with(".avi") ||
-        r.ends_with(".mov") || r.ends_with(".webm") || r.ends_with(".mp3") ||
-        r.ends_with(".flac") || r.ends_with(".m4a") || r.ends_with(".ogg") ||
-        r.ends_with(".m3u") || r.ends_with(".m3u8") ||
-        r.ends_with(".ts")  || r.ends_with(".wmv")
-    });
-
     results
 }
 
@@ -1079,16 +913,15 @@ async fn send_node_cmd(ws_tx: &mut WsSink, cmd: &str, params: serde_json::Value)
     let _ = ws_tx.send(Message::Text(msg.to_string())).await;
 }
 
-// Reload mpv's in-memory playlist from the .m3u file.
 async fn reload_playlist_cmd(ws_tx: &mut WsSink, pane: &str) {
-    let path = pane_playlist_path(pane);
+    let path = pane_playlist(pane);
     send_cmd(ws_tx, pane, "loadlist",
         serde_json::json!([path.to_string_lossy(), "replace"])).await;
 }
 
 // ---------------------------------------------------------------------------
 // Spawn daemon sibling binary — macOS only.
-// On Linux the daemon runs as a systemd service; we never spawn it.
+// On Linux the daemon runs as a systemd service.
 // ---------------------------------------------------------------------------
 
 #[cfg(target_os = "macos")]
@@ -1161,7 +994,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             } else {
                                 render(terminal, &app)?;
                             }
-                            // TODO: reconnect loop for multi-node resilience
                             break;
                         }
                         if app.show_details {
@@ -1172,8 +1004,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                     }
                     Some(Err(_)) | None => {
                         log_node(&mut app, vec![("connection lost".to_string(), C_RED)]);
-                        render(&mut *terminal, &app)?;
-                        // TODO: reconnect loop
+                        render(terminal, &app)?;
                         break;
                     }
                     _ => {}
@@ -1184,7 +1015,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                 match key {
                     Some(Ok(Event::Key(k))) => {
 
-                        // q — quit always (unless typing in add mode)
                         if k.code == KeyCode::Char('q') && app.details_mode != DetailsMode::Add {
                             break;
                         }
@@ -1240,7 +1070,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                         render_details(terminal, &app)?;
                                     }
                                     KeyCode::Tab => {
-                                        // Accept current completion or cycle
                                         if !app.add_completions.is_empty() {
                                             let comp = app.add_completions[app.add_comp_sel].clone();
                                             app.add_input       = comp;
@@ -1263,7 +1092,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                         let entry = app.add_input.trim().to_string();
                                         if !entry.is_empty() {
                                             if let Some(pane) = app.selected_name() {
-                                                // Expand ~ before writing
                                                 let expanded = if entry.starts_with('~') {
                                                     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
                                                     entry.replacen('~', &home, 1)
@@ -1320,7 +1148,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                             if let Some(src_pane) = app.selected_name() {
                                                 let idx         = app.playlist_sel;
                                                 let current_pos = app.current_playlist_pos();
-                                                // Block if playing
                                                 if current_pos >= 0 && current_pos as usize == idx {
                                                     app.status_msg   = Some("Cannot move playing item".to_string());
                                                     app.details_mode = DetailsMode::Normal;
@@ -1328,10 +1155,8 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                                     continue;
                                                 }
                                                 if let Some(entry) = app.playlist_items.get(idx).cloned() {
-                                                    // Append to target
                                                     let _ = m3u_append(&target, &entry);
                                                     reload_playlist_cmd(&mut ws_tx, &target).await;
-                                                    // Remove from source
                                                     match m3u_remove(&src_pane, idx, current_pos) {
                                                         Ok(Some(items)) => {
                                                             app.playlist_items = items;
@@ -1362,22 +1187,15 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             // -- Command mode --
                             if app.details_mode == DetailsMode::Command {
                                 match k.code {
-                                    KeyCode::Tab => {
-                                        app.details_mode = DetailsMode::Normal;
-                                        app.status_msg   = None;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Esc => {
+                                    KeyCode::Tab | KeyCode::Esc => {
                                         app.details_mode = DetailsMode::Normal;
                                         app.status_msg   = None;
                                         render_details(terminal, &app)?;
                                     }
                                     KeyCode::Enter => {
-                                        // Play selected item (start from idle if needed)
                                         if let Some(pane) = app.selected_name() {
                                             let ps = app.panes.get(&pane);
                                             if ps.map(|p| p.idle_active).unwrap_or(true) {
-                                                // Idle — reload list then play index
                                                 reload_playlist_cmd(&mut ws_tx, &pane).await;
                                                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                             }
@@ -1433,9 +1251,9 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             // -- Normal mode --
                             match k.code {
                                 KeyCode::Esc => {
-                                    app.show_details  = false;
-                                    app.details_mode  = DetailsMode::Normal;
-                                    app.status_msg    = None;
+                                    app.show_details = false;
+                                    app.details_mode = DetailsMode::Normal;
+                                    app.status_msg   = None;
                                     app.jump_input.clear();
                                     render(terminal, &app)?;
                                 }
@@ -1457,24 +1275,16 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                     render_details(terminal, &app)?;
                                 }
                                 KeyCode::Char('J') => {
-                                    // Jump to end
                                     app.playlist_sel = app.playlist_items.len().saturating_sub(1);
                                     app.status_msg   = None;
                                     render_details(terminal, &app)?;
                                 }
-                                KeyCode::Char('j') => {
-                                    // This arm is unreachable because Down/'j' above catches it —
-                                    // 'j' for jump is intentionally on lowercase, handled above.
-                                    // Jump prompt is on 'g' below instead to avoid conflict.
-                                }
                                 KeyCode::Char('g') => {
-                                    // Jump prompt (g to avoid clash with j=down)
                                     app.details_mode = DetailsMode::Jump;
                                     app.jump_input.clear();
                                     render_details(terminal, &app)?;
                                 }
                                 KeyCode::Char('n') => {
-                                    // Add new item
                                     app.details_mode    = DetailsMode::Add;
                                     app.add_input.clear();
                                     app.add_completions = Vec::new();
@@ -1483,7 +1293,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                     render_details(terminal, &app)?;
                                 }
                                 KeyCode::Char('C') => {
-                                    // Crop — keep only playing item
                                     if let Some(pane) = app.selected_name() {
                                         let current_pos = app.current_playlist_pos();
                                         match m3u_crop(&pane, current_pos) {
@@ -1512,7 +1321,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                         // DASHBOARD
                         // ================================================================
 
-                        // Layout picker
                         if app.show_picker {
                             match k.code {
                                 KeyCode::Char('j') | KeyCode::Down => {
@@ -1543,7 +1351,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             continue;
                         }
 
-                        // W — open layout picker
                         if k.code == KeyCode::Char('W') {
                             app.picker_sel = app.layouts.iter().position(|l| l == &app.layout).unwrap_or(0);
                             app.show_picker = true;
@@ -1551,7 +1358,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             continue;
                         }
 
-                        // Enter — open details screen for selected pane
                         if k.code == KeyCode::Enter {
                             if let Some(pane) = app.selected_name() {
                                 app.playlist_items = read_m3u(&pane);
@@ -1566,14 +1372,12 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             continue;
                         }
 
-                        // Tab — toggle command mode
                         if k.code == KeyCode::Tab {
                             app.command_mode = !app.command_mode;
                             render(terminal, &app)?;
                             continue;
                         }
 
-                        // Shift-L — toggle log view
                         let shift_l = k.code == KeyCode::Char('L') ||
                             (k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::SHIFT));
                         if shift_l {
@@ -1582,7 +1386,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             continue;
                         }
 
-                        // Navigation — normal mode only
                         if !app.command_mode {
                             match k.code {
                                 KeyCode::Char('j') | KeyCode::Down => { app.select_next(); render(terminal, &app)?; continue; }
@@ -1591,7 +1394,6 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             }
                         }
 
-                        // Player controls — command mode only
                         if app.command_mode {
                             if let Some(pane) = app.selected_name() {
                                 match k.code {
