@@ -18,15 +18,18 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use panebot_lib::{
-    pane_playlist, read_m3u, write_m3u, m3u_append, m3u_remove, m3u_crop,
+    layouts_dir, pane_playlist, read_m3u, m3u_append, m3u_remove, m3u_crop,
+    load_hosts, Host,
 };
 
 // ---------------------------------------------------------------------------
 // Config
 // ---------------------------------------------------------------------------
 
-const DAEMON_ADDR: &str   = "ws://127.0.0.1:9090";
-const LOG_CAPACITY: usize = 500;
+const LOCAL_ADDR:        &str  = "ws://127.0.0.1:9090";
+const LOG_CAPACITY:     usize  = 500;
+const CONNECT_RETRY_MS:  u64   = 500;
+const CONNECT_TIMEOUT_S: u64   = 30;
 
 // ---------------------------------------------------------------------------
 // Colors
@@ -53,12 +56,13 @@ type WsSink = futures_util::stream::SplitSink<
 >;
 
 // ---------------------------------------------------------------------------
-// Pane state — mirrors PaneState in daemon
-// Note: kept separate from daemon's PaneState as TUI does not need Serialize.
+// Pane state — mirrors PaneState in daemon.
+// Kept separate as the TUI does not need serde::Serialize.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 struct PaneState {
+    #[allow(dead_code)]
     name:         String,
     pane_type:    String,
     online:       bool,
@@ -126,6 +130,7 @@ struct App {
     panes:           HashMap<String, PaneState>,
     selected:        usize,
     hostname:        String,
+    platform:        String,
     layout:          String,
     log:             VecDeque<LogLine>,
     show_log:        bool,
@@ -140,8 +145,6 @@ struct App {
     status_msg:      Option<String>,
     jump_input:      String,
     add_input:       String,
-    add_completions: Vec<String>,
-    add_comp_sel:    usize,
     send_picker_sel: usize,
 }
 
@@ -152,6 +155,7 @@ impl App {
             panes:           HashMap::new(),
             selected:        0,
             hostname:        String::new(),
+            platform:        String::new(),
             layout:          String::new(),
             log:             VecDeque::with_capacity(LOG_CAPACITY),
             show_log:        false,
@@ -166,8 +170,6 @@ impl App {
             status_msg:      None,
             jump_input:      String::new(),
             add_input:       String::new(),
-            add_completions: Vec::new(),
-            add_comp_sel:    0,
             send_picker_sel: 0,
         }
     }
@@ -208,6 +210,26 @@ impl App {
         let pos = self.current_playlist_pos();
         pos >= 0 && pos as usize == self.playlist_sel
     }
+
+    fn load_layouts(&mut self) {
+        let mut layouts = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(layouts_dir()) {
+            let mut names: Vec<_> = entries
+                .filter_map(|e| e.ok())
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.ends_with(".layout") {
+                        Some(name.trim_end_matches(".layout").to_string())
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            names.sort();
+            layouts = names;
+        }
+        self.layouts = layouts;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -246,30 +268,21 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
 
     match event {
 
-        "bootstrap_complete" => {
+        // node:snapshot — fires on connect and reconnect, replaces bootstrap_complete.
+        // Pane online state comes from subsequent online/offline events.
+        "node:snapshot" => {
             app.hostname = v["hostname"].as_str().unwrap_or("").to_string();
+            app.platform = v["platform"].as_str().unwrap_or("").to_string();
             app.layout   = v["layout"].as_str().unwrap_or("").to_string();
-            app.layouts  = vec![
-                "pb.left.stack".to_string(),
-                "pb.right.stack".to_string(),
-                "pb.sway.left.stack".to_string(),
-                "pb.sway.right.stack".to_string(),
-            ];
+            app.load_layouts();
 
             if let Some(panes) = v["panes"].as_array() {
                 for p in panes {
-                    let name   = p["name"].as_str().unwrap_or("").to_string();
-                    let ptype  = p["pane_type"].as_str().unwrap_or("video").to_string();
-                    let online = p["status"].as_str() == Some("Online");
+                    let name  = p["name"].as_str().unwrap_or("").to_string();
+                    let ptype = p["pane_type"].as_str().unwrap_or("video").to_string();
                     if !name.is_empty() && !app.pane_order.contains(&name) {
                         app.pane_order.push(name.clone());
-                        let mut ps = PaneState::new(&name, &ptype);
-                        ps.online = online;
-                        app.panes.insert(name.clone(), ps);
-                        log_event(app, &name, vec![(
-                            if online { "Online".to_string()  } else { "Offline".to_string() },
-                            if online { C_GREEN               } else { C_RED                  },
-                        )]);
+                        app.panes.insert(name.clone(), PaneState::new(&name, &ptype));
                     }
                 }
             }
@@ -302,11 +315,11 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
             if let Some(ps) = app.panes.get_mut(pane) {
                 match prop {
                     "pause"        => { ps.paused       = v["value"].as_bool().unwrap_or(true); }
-                    "volume"       => { ps.volume        = v["value"].as_f64().unwrap_or(0.0); }
-                    "media-title"  => { ps.title         = v["value"].as_str().unwrap_or("").to_string(); }
-                    "playlist-pos" => { ps.playlist_pos  = v["value"].as_i64().unwrap_or(-1); }
-                    "mute"         => { ps.muted         = v["value"].as_bool().unwrap_or(false); }
-                    "idle-active"  => { ps.idle_active   = v["value"].as_bool().unwrap_or(true); }
+                    "volume"       => { ps.volume       = v["value"].as_f64().unwrap_or(0.0); }
+                    "media-title"  => { ps.title        = v["value"].as_str().unwrap_or("").to_string(); }
+                    "playlist-pos" => { ps.playlist_pos = v["value"].as_i64().unwrap_or(-1); }
+                    "mute"         => { ps.muted        = v["value"].as_bool().unwrap_or(false); }
+                    "idle-active"  => { ps.idle_active  = v["value"].as_bool().unwrap_or(true); }
                     _ => {}
                 }
             }
@@ -383,18 +396,71 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
 
 fn apply_state(ps: &mut PaneState, state: &serde_json::Value) {
     if let Some(v) = state["paused"].as_bool()      { ps.paused       = v; }
-    if let Some(v) = state["muted"].as_bool()       { ps.muted        = v; }
-    if let Some(v) = state["idle_active"].as_bool() { ps.idle_active  = v; }
-    if let Some(v) = state["volume"].as_f64()       { ps.volume       = v; }
-    if let Some(v) = state["playlist_pos"].as_i64() { ps.playlist_pos = v; }
-    if let Some(v) = state["title"].as_str()        { ps.title        = v.to_string(); }
+    if let Some(v) = state["muted"].as_bool()        { ps.muted        = v; }
+    if let Some(v) = state["idle_active"].as_bool()  { ps.idle_active  = v; }
+    if let Some(v) = state["volume"].as_f64()        { ps.volume       = v; }
+    if let Some(v) = state["playlist_pos"].as_i64()  { ps.playlist_pos = v; }
+    if let Some(v) = state["title"].as_str()         { ps.title        = v.to_string(); }
 }
 
 // ---------------------------------------------------------------------------
-// Rendering — dashboard
+// Rendering — host picker screen
 // ---------------------------------------------------------------------------
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
+
+fn render_host_picker(terminal: &mut Term, hosts: &[Host], sel: usize) -> io::Result<()> {
+    terminal.draw(|f| {
+        let size = f.size();
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+                Constraint::Length(1),
+                Constraint::Length(1),
+            ])
+            .split(size);
+
+        f.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled("[PaneBot]", Style::default().fg(C_ORANGE)),
+            Span::styled(" :: ",     Style::default().fg(C_DIM)),
+            Span::styled("Select node to connect", Style::default().fg(C_HINT)),
+        ])), chunks[0]);
+
+        f.render_widget(divider(size.width as usize), chunks[1]);
+
+        let items: Vec<ListItem> = hosts.iter().enumerate().map(|(i, host)| {
+            let is_sel = i == sel;
+            let cursor = if is_sel { Span::styled(">> ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") };
+            let item = ListItem::new(Line::from(vec![
+                cursor,
+                Span::styled(host.label.clone(), Style::default()
+                    .fg(if is_sel { C_WHITE } else { C_HINT })
+                    .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })
+                ),
+                Span::styled(" :: ", Style::default().fg(C_DIM)),
+                Span::styled(host.address.clone(), Style::default().fg(C_DIM)),
+            ]));
+            if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
+        }).collect();
+
+        f.render_widget(List::new(items), chunks[2]);
+        f.render_widget(divider(size.width as usize), chunks[3]);
+        f.render_widget(Paragraph::new(Line::from(vec![
+            Span::styled("[up/dn]", Style::default().fg(C_DIM)),
+            Span::styled(" Select",  Style::default().fg(C_DIM)),
+            Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+            Span::styled("[Enter]",  Style::default().fg(C_DIM)),
+            Span::styled(" Connect", Style::default().fg(C_DIM)),
+            Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+            Span::styled("[q]",      Style::default().fg(C_DIM)),
+            Span::styled(" Quit",    Style::default().fg(C_DIM)),
+        ])), chunks[4]);
+    })?;
+    Ok(())
+}
 
 fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
     terminal.draw(|f| {
@@ -424,7 +490,10 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Style::default().fg(C_CYAN),
             ),
             Span::styled(" :: ",     Style::default().fg(C_DIM)),
-            Span::styled(app.hostname.clone(), Style::default().fg(C_DIM)),
+            Span::styled(
+                format!("{} [{}]", app.hostname, app.platform),
+                Style::default().fg(C_DIM),
+            ),
         ])), chunks[0]);
 
         f.render_widget(divider(size.width as usize), chunks[1]);
@@ -596,7 +665,7 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering — startup
+// Rendering — startup status line
 // ---------------------------------------------------------------------------
 
 fn render_startup(terminal: &mut Term, status: &str) -> io::Result<()> {
@@ -752,20 +821,11 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("  [Enter] Go  [Esc] Cancel", Style::default().fg(C_DIM)),
             ]),
 
-            DetailsMode::Add => {
-                let match_hint = if app.add_completions.is_empty() {
-                    String::new()
-                } else {
-                    format!(" [{} match{}]",
-                        app.add_completions.len(),
-                        if app.add_completions.len() == 1 { "" } else { "es" })
-                };
-                Line::from(vec![
-                    Span::styled("Add: ", Style::default().fg(C_HINT)),
-                    Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
-                    Span::styled(match_hint, Style::default().fg(C_DIM)),
-                ])
-            },
+            DetailsMode::Add => Line::from(vec![
+                Span::styled("Add: ", Style::default().fg(C_HINT)),
+                Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled("  [Enter] Add  [Esc] Cancel", Style::default().fg(C_DIM)),
+            ]),
 
             DetailsMode::Send => Line::from(vec![
                 Span::styled("[up/dn] Select pane", Style::default().fg(C_DIM)),
@@ -851,51 +911,6 @@ fn divider(width: usize) -> Paragraph<'static> {
 }
 
 // ---------------------------------------------------------------------------
-// Path completion for add mode
-// ---------------------------------------------------------------------------
-
-fn build_completions(input: &str) -> Vec<String> {
-    let expanded = if input.starts_with('~') {
-        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-        input.replacen('~', &home, 1)
-    } else {
-        input.to_string()
-    };
-
-    let (dir, prefix) = if expanded.ends_with('/') {
-        (expanded.as_str(), "")
-    } else {
-        match expanded.rfind('/') {
-            Some(i) => (&expanded[..=i], &expanded[i+1..]),
-            None    => ("./", expanded.as_str()),
-        }
-    };
-
-    let read_dir = match std::fs::read_dir(dir) {
-        Ok(rd) => rd,
-        Err(_) => return Vec::new(),
-    };
-
-    let mut results: Vec<String> = read_dir
-        .filter_map(|e| e.ok())
-        .filter_map(|e| {
-            let name = e.file_name().to_string_lossy().to_string();
-            if !name.starts_with(prefix) { return None; }
-            let mut full = format!("{}{}", dir, name);
-            if e.path().is_dir() { full.push('/'); }
-            let home = std::env::var("HOME").unwrap_or_default();
-            if !home.is_empty() && full.starts_with(&home) {
-                full = full.replacen(&home, "~", 1);
-            }
-            Some(full)
-        })
-        .collect();
-
-    results.sort();
-    results
-}
-
-// ---------------------------------------------------------------------------
 // Send commands to daemon
 // ---------------------------------------------------------------------------
 
@@ -919,18 +934,70 @@ async fn reload_playlist_cmd(ws_tx: &mut WsSink, pane: &str) {
         serde_json::json!([path.to_string_lossy(), "replace"])).await;
 }
 
+async fn cmd_stop_all(ws_tx: &mut WsSink, pane_order: &[String]) {
+    for pane in pane_order {
+        send_cmd(ws_tx, pane, "stop", serde_json::json!([])).await;
+    }
+}
+
+async fn cmd_start_all(ws_tx: &mut WsSink, pane_order: &[String]) {
+    for pane in pane_order {
+        send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", false])).await;
+    }
+}
+
+async fn cmd_solo(ws_tx: &mut WsSink, solo: &str, pane_order: &[String]) {
+    for pane in pane_order {
+        if pane == solo {
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute",  false])).await;
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", false])).await;
+        } else {
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute", true])).await;
+        }
+    }
+}
+
+async fn cmd_mute_others(ws_tx: &mut WsSink, keep: &str, pane_order: &[String]) {
+    for pane in pane_order {
+        if pane != keep {
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute", true])).await;
+        }
+    }
+}
+
+async fn cmd_swap_volume(ws_tx: &mut WsSink, pane_a: &str, pane_b: &str, panes: &HashMap<String, PaneState>) {
+    let vol_a = panes.get(pane_a).map(|p| p.volume).unwrap_or(0.0);
+    let vol_b = panes.get(pane_b).map(|p| p.volume).unwrap_or(0.0);
+    send_cmd(ws_tx, pane_a, "set_property", serde_json::json!(["volume", vol_b])).await;
+    send_cmd(ws_tx, pane_b, "set_property", serde_json::json!(["volume", vol_a])).await;
+}
+
+async fn cmd_set_volume_all(ws_tx: &mut WsSink, vol: f64, pane_order: &[String]) {
+    for pane in pane_order {
+        send_cmd(ws_tx, pane, "set_property", serde_json::json!(["volume", vol])).await;
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Spawn daemon sibling binary — macOS only.
-// On Linux the daemon runs as a systemd service.
+// Spawn daemon sibling binary.
+//
+// Platform agnostic — if panebot-daemon exists next to the TUI binary,
+// spawn it. Works on macOS, Linux without systemd, or any manual deployment.
+// Returns Ok(()) if spawned, Err if binary not found or spawn fails.
 // ---------------------------------------------------------------------------
 
-#[cfg(target_os = "macos")]
 fn spawn_daemon() -> io::Result<()> {
     use std::os::unix::process::CommandExt;
+
     let daemon_path = std::env::current_exe()?
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not determine binary dir"))?
         .join("panebot-daemon");
+
+    if !daemon_path.exists() {
+        return Err(io::Error::new(io::ErrorKind::NotFound,
+            format!("{} not found", daemon_path.display())));
+    }
 
     std::process::Command::new(&daemon_path)
         .process_group(0)
@@ -943,480 +1010,522 @@ fn spawn_daemon() -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Main event loop
+// WebSocket connection — connect with retry.
+//
+// Local address: try to spawn the daemon binary if present, then wait
+//   indefinitely — the daemon may just be starting up.
+// Remote address: retry with countdown, give up after CONNECT_TIMEOUT_S.
+//
+// The spawn attempt is best-effort — if no binary is present (e.g. systemd
+// manages the daemon) we skip it and just wait for the connection.
 // ---------------------------------------------------------------------------
 
-async fn run(terminal: &mut Term) -> io::Result<()> {
+async fn connect_ws(
+    terminal: &mut Term,
+    addr:     &str,
+) -> io::Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
 
-    render_startup(terminal, "Connecting to daemon...")?;
+    render_startup(terminal, &format!("Connecting to {}...", addr))?;
 
-    let ws = match connect_async(DAEMON_ADDR).await {
-        Ok((ws, _)) => ws,
+    // Fast path — daemon already running
+    if let Ok((ws, _)) = connect_async(addr).await {
+        return Ok(ws);
+    }
 
-        #[cfg(target_os = "macos")]
-        Err(_) => {
-            render_startup(terminal, "Starting daemon...")?;
-            if let Err(e) = spawn_daemon() {
-                render_startup(terminal, &format!("Failed to start daemon: {}", e))?;
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                return Ok(());
+    let is_local = addr == LOCAL_ADDR;
+
+    if is_local {
+        // Try to spawn the daemon binary if it exists alongside us
+        match spawn_daemon() {
+            Ok(())   => render_startup(terminal, "Starting daemon...")?,
+            Err(e)   => render_startup(terminal, &format!("Waiting for daemon... ({})", e))?,
+        }
+        // Wait indefinitely — daemon may be starting or managed externally
+        loop {
+            render_startup(terminal, "Waiting for daemon...")?;
+            tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
+            if let Ok((ws, _)) = connect_async(addr).await {
+                return Ok(ws);
             }
+        }
+    }
+
+    // Remote address — retry with countdown, give up after timeout
+    let retries = (CONNECT_TIMEOUT_S * 1000 / CONNECT_RETRY_MS) as u32;
+    for attempt in 0..retries {
+        let remaining = CONNECT_TIMEOUT_S.saturating_sub(attempt as u64 * CONNECT_RETRY_MS / 1000);
+        render_startup(terminal, &format!("Waiting for {} ({}s)...", addr, remaining))?;
+        tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
+        if let Ok((ws, _)) = connect_async(addr).await {
+            return Ok(ws);
+        }
+    }
+
+    Err(io::Error::new(io::ErrorKind::TimedOut,
+        format!("Could not connect to {} after {}s", addr, CONNECT_TIMEOUT_S)))
+}
+
+async fn resolve_daemon_addr(terminal: &mut Term) -> io::Result<Option<String>> {
+    let hosts = load_hosts();
+
+    match hosts.len() {
+        0 => Ok(Some(LOCAL_ADDR.to_string())),
+        1 => Ok(Some(hosts[0].address.clone())),
+        _ => {
+            let mut sel        = 0usize;
+            let mut key_events = EventStream::new();
+            render_host_picker(terminal, &hosts, sel)?;
+
             loop {
-                render_startup(terminal, "Waiting for daemon...")?;
-                match connect_async(DAEMON_ADDR).await {
-                    Ok((ws, _)) => break ws,
-                    Err(_)      => tokio::time::sleep(std::time::Duration::from_millis(500)).await,
+                if let Some(Ok(Event::Key(k))) = key_events.next().await {
+                    match k.code {
+                        KeyCode::Char('q') => return Ok(None),
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            sel = sel.saturating_sub(1);
+                            render_host_picker(terminal, &hosts, sel)?;
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if sel + 1 < hosts.len() { sel += 1; }
+                            render_host_picker(terminal, &hosts, sel)?;
+                        }
+                        KeyCode::Enter => {
+                            return Ok(Some(hosts[sel].address.clone()));
+                        }
+                        _ => {}
+                    }
                 }
             }
         }
+    }
+}
 
-        #[cfg(not(target_os = "macos"))]
-        Err(_) => {
-            render_startup(terminal, "Daemon not running. Start panebot-daemon service.")?;
-            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-            return Ok(());
+// ---------------------------------------------------------------------------
+// Key action — returned from handle_key to tell run() what to do
+// ---------------------------------------------------------------------------
+
+enum KeyAction {
+    Quit,
+    Render,
+    RenderDetails,
+    Nothing,
+}
+
+// ---------------------------------------------------------------------------
+// Key handler — all key logic lives here, run() just dispatches
+// ---------------------------------------------------------------------------
+
+async fn handle_key(
+    app:    &mut App,
+    k:      crossterm::event::KeyEvent,
+    ws_tx:  &mut WsSink,
+) -> io::Result<KeyAction> {
+
+    if k.code == KeyCode::Char('q') && app.details_mode != DetailsMode::Add {
+        return Ok(KeyAction::Quit);
+    }
+
+    // ================================================================
+    // DETAILS SCREEN
+    // ================================================================
+    if app.show_details {
+
+        // -- Jump mode --
+        if app.details_mode == DetailsMode::Jump {
+            match k.code {
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    app.jump_input.push(c);
+                }
+                KeyCode::Backspace => {
+                    app.jump_input.pop();
+                }
+                KeyCode::Enter => {
+                    if let Ok(idx) = app.jump_input.parse::<usize>() {
+                        let max = app.playlist_items.len().saturating_sub(1);
+                        app.playlist_sel = idx.min(max);
+                    }
+                    app.jump_input.clear();
+                    app.details_mode = DetailsMode::Normal;
+                }
+                KeyCode::Esc => {
+                    app.jump_input.clear();
+                    app.details_mode = DetailsMode::Normal;
+                }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::RenderDetails);
         }
-    };
 
-    let (mut ws_tx, mut ws_rx) = ws.split();
+        // -- Add mode --
+        if app.details_mode == DetailsMode::Add {
+            match k.code {
+                KeyCode::Char(c) => {
+                    app.add_input.push(c);
+                }
+                KeyCode::Backspace => {
+                    app.add_input.pop();
+                }
+                KeyCode::Enter => {
+                    let entry = app.add_input.trim().to_string();
+                    if !entry.is_empty() {
+                        if let Some(pane) = app.selected_name() {
+                            let expanded = if entry.starts_with('~') {
+                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                                entry.replacen('~', &home, 1)
+                            } else {
+                                entry.clone()
+                            };
+                            match m3u_append(&pane, &expanded) {
+                                Ok(items) => {
+                                    app.playlist_items = items;
+                                    reload_playlist_cmd(ws_tx, &pane).await;
+                                }
+                                Err(e) => {
+                                    app.status_msg = Some(format!("Add failed: {}", e));
+                                }
+                            }
+                        }
+                    }
+                    app.add_input.clear();
+                    app.details_mode = DetailsMode::Normal;
+                }
+                KeyCode::Esc => {
+                    app.add_input.clear();
+                    app.details_mode = DetailsMode::Normal;
+                }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::RenderDetails);
+        }
+
+        // -- Send picker mode --
+        if app.details_mode == DetailsMode::Send {
+            let other_panes: Vec<String> = app.pane_order.iter()
+                .filter(|n| Some(*n) != app.selected_name().as_ref())
+                .cloned()
+                .collect();
+            match k.code {
+                KeyCode::Char('k') | KeyCode::Up => {
+                    app.send_picker_sel = app.send_picker_sel.saturating_sub(1);
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if app.send_picker_sel + 1 < other_panes.len() {
+                        app.send_picker_sel += 1;
+                    }
+                }
+                KeyCode::Enter => {
+                    if let Some(target) = other_panes.get(app.send_picker_sel) {
+                        let target = target.clone();
+                        if let Some(src_pane) = app.selected_name() {
+                            let idx         = app.playlist_sel;
+                            let current_pos = app.current_playlist_pos();
+                            if current_pos >= 0 && current_pos as usize == idx {
+                                app.status_msg   = Some("Cannot move playing item".to_string());
+                                app.details_mode = DetailsMode::Normal;
+                                return Ok(KeyAction::RenderDetails);
+                            }
+                            if let Some(entry) = app.playlist_items.get(idx).cloned() {
+                                let _ = m3u_append(&target, &entry);
+                                reload_playlist_cmd(ws_tx, &target).await;
+                                match m3u_remove(&src_pane, idx, current_pos) {
+                                    Ok(Some(items)) => {
+                                        app.playlist_items = items;
+                                        if app.playlist_sel > 0 && app.playlist_sel >= app.playlist_items.len() {
+                                            app.playlist_sel -= 1;
+                                        }
+                                        reload_playlist_cmd(ws_tx, &src_pane).await;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    app.details_mode    = DetailsMode::Normal;
+                    app.send_picker_sel = 0;
+                }
+                KeyCode::Esc => {
+                    app.details_mode    = DetailsMode::Normal;
+                    app.send_picker_sel = 0;
+                }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::RenderDetails);
+        }
+
+        // -- Command mode --
+        if app.details_mode == DetailsMode::Command {
+            match k.code {
+                KeyCode::Tab | KeyCode::Esc => {
+                    app.details_mode = DetailsMode::Normal;
+                    app.status_msg   = None;
+                }
+                KeyCode::Enter => {
+                    if let Some(pane) = app.selected_name() {
+                        let ps = app.panes.get(&pane);
+                        if ps.map(|p| p.idle_active).unwrap_or(true) {
+                            reload_playlist_cmd(ws_tx, &pane).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        send_cmd(ws_tx, &pane, "playlist-play-index",
+                            serde_json::json!([app.playlist_sel])).await;
+                        send_cmd(ws_tx, &pane, "set_property",
+                            serde_json::json!(["pause", false])).await;
+                    }
+                    app.status_msg = None;
+                }
+                KeyCode::Char('R') => {
+                    if app.sel_is_playing() {
+                        app.status_msg = Some("Cannot remove playing item".to_string());
+                    } else if let Some(pane) = app.selected_name() {
+                        let current_pos = app.current_playlist_pos();
+                        match m3u_remove(&pane, app.playlist_sel, current_pos) {
+                            Ok(Some(items)) => {
+                                app.playlist_items = items;
+                                if app.playlist_sel > 0 && app.playlist_sel >= app.playlist_items.len() {
+                                    app.playlist_sel -= 1;
+                                }
+                                reload_playlist_cmd(ws_tx, &pane).await;
+                                app.status_msg = None;
+                            }
+                            Ok(None) => { app.status_msg = Some("Cannot remove playing item".to_string()); }
+                            Err(e)   => { app.status_msg = Some(format!("Remove failed: {}", e)); }
+                        }
+                    }
+                }
+                KeyCode::Char('S') => {
+                    if app.sel_is_playing() {
+                        app.status_msg = Some("Cannot move playing item".to_string());
+                    } else if app.pane_order.len() > 1 {
+                        app.details_mode    = DetailsMode::Send;
+                        app.send_picker_sel = 0;
+                        app.status_msg      = None;
+                    }
+                }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::RenderDetails);
+        }
+
+        // -- Normal mode (details) --
+        match k.code {
+            KeyCode::Esc => {
+                app.show_details = false;
+                app.details_mode = DetailsMode::Normal;
+                app.status_msg   = None;
+                app.jump_input.clear();
+                return Ok(KeyAction::Render);
+            }
+            KeyCode::Tab => {
+                app.details_mode = DetailsMode::Command;
+                app.status_msg   = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                app.playlist_sel = app.playlist_sel.saturating_sub(1);
+                app.status_msg   = None;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if app.playlist_sel + 1 < app.playlist_items.len() {
+                    app.playlist_sel += 1;
+                }
+                app.status_msg = None;
+            }
+            KeyCode::Char('J') => {
+                app.playlist_sel = app.playlist_items.len().saturating_sub(1);
+                app.status_msg   = None;
+            }
+            KeyCode::Char('g') => {
+                app.details_mode = DetailsMode::Jump;
+                app.jump_input.clear();
+            }
+            KeyCode::Char('n') => {
+                app.details_mode = DetailsMode::Add;
+                app.add_input.clear();
+                app.status_msg   = None;
+            }
+            KeyCode::Char('C') => {
+                if let Some(pane) = app.selected_name() {
+                    let current_pos = app.current_playlist_pos();
+                    match m3u_crop(&pane, current_pos) {
+                        Ok(Some(items)) => {
+                            app.playlist_items = items;
+                            app.playlist_sel   = 0;
+                            reload_playlist_cmd(ws_tx, &pane).await;
+                            app.status_msg = None;
+                        }
+                        Ok(None) => { app.status_msg = Some("Nothing playing to crop around".to_string()); }
+                        Err(e)   => { app.status_msg = Some(format!("Crop failed: {}", e)); }
+                    }
+                }
+            }
+            _ => return Ok(KeyAction::Nothing),
+        }
+        return Ok(KeyAction::RenderDetails);
+    }
+
+    // ================================================================
+    // DASHBOARD
+    // ================================================================
+
+    if app.show_picker {
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if app.picker_sel + 1 < app.layouts.len() {
+                    app.picker_sel += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                app.picker_sel = app.picker_sel.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(layout) = app.layouts.get(app.picker_sel) {
+                    let layout = layout.clone();
+                    send_node_cmd(ws_tx, "panebot:layout",
+                        serde_json::json!({"layout_name": layout})).await;
+                    app.show_picker = false;
+                }
+            }
+            KeyCode::Esc | KeyCode::Char('W') => {
+                app.show_picker = false;
+            }
+            _ => return Ok(KeyAction::Nothing),
+        }
+        return Ok(KeyAction::Render);
+    }
+
+    if k.code == KeyCode::Char('W') {
+        app.picker_sel  = app.layouts.iter().position(|l| l == &app.layout).unwrap_or(0);
+        app.show_picker = true;
+        return Ok(KeyAction::Render);
+    }
+
+    if k.code == KeyCode::Enter {
+        if let Some(pane) = app.selected_name() {
+            app.playlist_items = read_m3u(&pane);
+            app.playlist_sel   = app.panes.get(&pane)
+                .map(|p| p.playlist_pos.max(0) as usize)
+                .unwrap_or(0);
+            app.show_details   = true;
+            app.details_mode   = DetailsMode::Normal;
+            app.status_msg     = None;
+            return Ok(KeyAction::RenderDetails);
+        }
+        return Ok(KeyAction::Nothing);
+    }
+
+    if k.code == KeyCode::Tab {
+        app.command_mode = !app.command_mode;
+        return Ok(KeyAction::Render);
+    }
+
+    let shift_l = k.code == KeyCode::Char('L') ||
+        (k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::SHIFT));
+    if shift_l {
+        app.show_log = !app.show_log;
+        return Ok(KeyAction::Render);
+    }
+
+    if !app.command_mode {
+        match k.code {
+            KeyCode::Char('j') | KeyCode::Down => { app.select_next(); return Ok(KeyAction::Render); }
+            KeyCode::Char('k') | KeyCode::Up   => { app.select_prev(); return Ok(KeyAction::Render); }
+            _ => {}
+        }
+    }
+
+    if app.command_mode {
+        if let Some(pane) = app.selected_name() {
+            match k.code {
+                KeyCode::Char(' ') => { send_cmd(ws_tx, &pane, "cycle",          serde_json::json!(["pause"])).await; }
+                KeyCode::Char('m') => { send_cmd(ws_tx, &pane, "cycle",          serde_json::json!(["mute"])).await; }
+                KeyCode::Char('j') | KeyCode::Down  => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-10, "relative"])).await; }
+                KeyCode::Char('k') | KeyCode::Up    => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([10,  "relative"])).await; }
+                KeyCode::Char('h') | KeyCode::Left  => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-60, "relative"])).await; }
+                KeyCode::Char('l') | KeyCode::Right => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([60,  "relative"])).await; }
+                KeyCode::Char('=') => { send_cmd(ws_tx, &pane, "add",            serde_json::json!(["volume",  5])).await; }
+                KeyCode::Char('-') => { send_cmd(ws_tx, &pane, "add",            serde_json::json!(["volume", -5.0])).await; }
+                KeyCode::Char('n') => { send_cmd(ws_tx, &pane, "playlist-next",  serde_json::json!([])).await; }
+                KeyCode::Char('N') => { send_cmd(ws_tx, &pane, "playlist-prev",  serde_json::json!([])).await; }
+                KeyCode::Char('f') => { send_cmd(ws_tx, &pane, "cycle",          serde_json::json!(["fullscreen"])).await; }
+                KeyCode::Char('R') => { send_node_cmd(ws_tx, "panebot:restart-pane", serde_json::json!({"pane": pane})).await; }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::Render);
+        }
+    }
+
+    Ok(KeyAction::Nothing)
+}
+
+// ---------------------------------------------------------------------------
+// Main event loop
+//
+// App state is created once and preserved across reconnects — log history,
+// pane selection, and layout name survive a daemon restart.
+// Pane online states are reset on reconnect since we'll get fresh events.
+// ---------------------------------------------------------------------------
+
+async fn run(terminal: &mut Term, addr: &str) -> io::Result<()> {
     let mut app        = App::new();
     let mut key_events = EventStream::new();
 
-    loop {
-        tokio::select! {
+    'reconnect: loop {
 
-            msg = ws_rx.next() => {
-                match msg {
-                    Some(Ok(Message::Text(text))) => {
-                        if process_event(&mut app, &text) == Some("node:down") {
-                            if app.show_details {
-                                render_details(terminal, &app)?;
-                            } else {
-                                render(terminal, &app)?;
-                            }
-                            break;
-                        }
-                        if app.show_details {
-                            render_details(terminal, &app)?;
-                        } else {
-                            render(terminal, &app)?;
-                        }
-                    }
-                    Some(Err(_)) | None => {
-                        log_node(&mut app, vec![("connection lost".to_string(), C_RED)]);
-                        render(terminal, &app)?;
-                        break;
-                    }
-                    _ => {}
-                }
+        let ws = match connect_ws(terminal, addr).await {
+            Ok(ws) => ws,
+            Err(e) => {
+                render_startup(terminal, &format!("{}", e))?;
+                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                return Ok(());
             }
+        };
 
-            key = key_events.next() => {
-                match key {
-                    Some(Ok(Event::Key(k))) => {
+        // Reset online state — fresh events will arrive from daemon
+        for ps in app.panes.values_mut() { ps.online = false; }
 
-                        if k.code == KeyCode::Char('q') && app.details_mode != DetailsMode::Add {
-                            break;
+        let (mut ws_tx, mut ws_rx) = ws.split();
+
+        loop {
+            tokio::select! {
+
+                msg = ws_rx.next() => {
+                    match msg {
+                        Some(Ok(Message::Text(text))) => {
+                            let signal = process_event(&mut app, &text);
+                            if app.show_details { render_details(terminal, &app)?; }
+                            else                { render(terminal, &app)?;         }
+                            if signal == Some("node:down") {
+                                log_node(&mut app, vec![("reconnecting...".to_string(), C_HINT)]);
+                                render(terminal, &app)?;
+                                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                                continue 'reconnect;
+                            }
                         }
-
-                        // ================================================================
-                        // DETAILS SCREEN
-                        // ================================================================
-                        if app.show_details {
-
-                            // -- Jump mode --
-                            if app.details_mode == DetailsMode::Jump {
-                                match k.code {
-                                    KeyCode::Char(c) if c.is_ascii_digit() => {
-                                        app.jump_input.push(c);
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Backspace => {
-                                        app.jump_input.pop();
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Ok(idx) = app.jump_input.parse::<usize>() {
-                                            let max = app.playlist_items.len().saturating_sub(1);
-                                            app.playlist_sel = idx.min(max);
-                                        }
-                                        app.jump_input.clear();
-                                        app.details_mode = DetailsMode::Normal;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Esc => {
-                                        app.jump_input.clear();
-                                        app.details_mode = DetailsMode::Normal;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-
-                            // -- Add mode --
-                            if app.details_mode == DetailsMode::Add {
-                                match k.code {
-                                    KeyCode::Char(c) => {
-                                        app.add_input.push(c);
-                                        app.add_completions = build_completions(&app.add_input);
-                                        app.add_comp_sel    = 0;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Backspace => {
-                                        app.add_input.pop();
-                                        app.add_completions = build_completions(&app.add_input);
-                                        app.add_comp_sel    = 0;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Tab => {
-                                        if !app.add_completions.is_empty() {
-                                            let comp = app.add_completions[app.add_comp_sel].clone();
-                                            app.add_input       = comp;
-                                            app.add_completions = build_completions(&app.add_input);
-                                            app.add_comp_sel    = 0;
-                                            render_details(terminal, &app)?;
-                                        }
-                                    }
-                                    KeyCode::Down => {
-                                        if app.add_comp_sel + 1 < app.add_completions.len() {
-                                            app.add_comp_sel += 1;
-                                            render_details(terminal, &app)?;
-                                        }
-                                    }
-                                    KeyCode::Up => {
-                                        app.add_comp_sel = app.add_comp_sel.saturating_sub(1);
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Enter => {
-                                        let entry = app.add_input.trim().to_string();
-                                        if !entry.is_empty() {
-                                            if let Some(pane) = app.selected_name() {
-                                                let expanded = if entry.starts_with('~') {
-                                                    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                                    entry.replacen('~', &home, 1)
-                                                } else {
-                                                    entry.clone()
-                                                };
-                                                match m3u_append(&pane, &expanded) {
-                                                    Ok(items) => {
-                                                        app.playlist_items = items;
-                                                        reload_playlist_cmd(&mut ws_tx, &pane).await;
-                                                    }
-                                                    Err(e) => {
-                                                        app.status_msg = Some(format!("Add failed: {}", e));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        app.add_input.clear();
-                                        app.add_completions.clear();
-                                        app.details_mode = DetailsMode::Normal;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Esc => {
-                                        app.add_input.clear();
-                                        app.add_completions.clear();
-                                        app.details_mode = DetailsMode::Normal;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-
-                            // -- Send picker mode --
-                            if app.details_mode == DetailsMode::Send {
-                                let other_panes: Vec<String> = app.pane_order.iter()
-                                    .filter(|n| Some(*n) != app.selected_name().as_ref())
-                                    .cloned()
-                                    .collect();
-                                match k.code {
-                                    KeyCode::Char('k') | KeyCode::Up => {
-                                        app.send_picker_sel = app.send_picker_sel.saturating_sub(1);
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Char('j') | KeyCode::Down => {
-                                        if app.send_picker_sel + 1 < other_panes.len() {
-                                            app.send_picker_sel += 1;
-                                        }
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Some(target) = other_panes.get(app.send_picker_sel) {
-                                            let target = target.clone();
-                                            if let Some(src_pane) = app.selected_name() {
-                                                let idx         = app.playlist_sel;
-                                                let current_pos = app.current_playlist_pos();
-                                                if current_pos >= 0 && current_pos as usize == idx {
-                                                    app.status_msg   = Some("Cannot move playing item".to_string());
-                                                    app.details_mode = DetailsMode::Normal;
-                                                    render_details(terminal, &app)?;
-                                                    continue;
-                                                }
-                                                if let Some(entry) = app.playlist_items.get(idx).cloned() {
-                                                    let _ = m3u_append(&target, &entry);
-                                                    reload_playlist_cmd(&mut ws_tx, &target).await;
-                                                    match m3u_remove(&src_pane, idx, current_pos) {
-                                                        Ok(Some(items)) => {
-                                                            app.playlist_items = items;
-                                                            if app.playlist_sel > 0 && app.playlist_sel >= app.playlist_items.len() {
-                                                                app.playlist_sel -= 1;
-                                                            }
-                                                            reload_playlist_cmd(&mut ws_tx, &src_pane).await;
-                                                        }
-                                                        _ => {}
-                                                    }
-                                                }
-                                            }
-                                        }
-                                        app.details_mode    = DetailsMode::Normal;
-                                        app.send_picker_sel = 0;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Esc => {
-                                        app.details_mode    = DetailsMode::Normal;
-                                        app.send_picker_sel = 0;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-
-                            // -- Command mode --
-                            if app.details_mode == DetailsMode::Command {
-                                match k.code {
-                                    KeyCode::Tab | KeyCode::Esc => {
-                                        app.details_mode = DetailsMode::Normal;
-                                        app.status_msg   = None;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Enter => {
-                                        if let Some(pane) = app.selected_name() {
-                                            let ps = app.panes.get(&pane);
-                                            if ps.map(|p| p.idle_active).unwrap_or(true) {
-                                                reload_playlist_cmd(&mut ws_tx, &pane).await;
-                                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                                            }
-                                            send_cmd(&mut ws_tx, &pane, "playlist-play-index",
-                                                serde_json::json!([app.playlist_sel])).await;
-                                            send_cmd(&mut ws_tx, &pane, "set_property",
-                                                serde_json::json!(["pause", false])).await;
-                                        }
-                                        app.status_msg = None;
-                                        render_details(terminal, &app)?;
-                                    }
-                                    KeyCode::Char('R') => {
-                                        if app.sel_is_playing() {
-                                            app.status_msg = Some("Cannot remove playing item".to_string());
-                                            render_details(terminal, &app)?;
-                                        } else if let Some(pane) = app.selected_name() {
-                                            let current_pos = app.current_playlist_pos();
-                                            match m3u_remove(&pane, app.playlist_sel, current_pos) {
-                                                Ok(Some(items)) => {
-                                                    app.playlist_items = items;
-                                                    if app.playlist_sel > 0 && app.playlist_sel >= app.playlist_items.len() {
-                                                        app.playlist_sel -= 1;
-                                                    }
-                                                    reload_playlist_cmd(&mut ws_tx, &pane).await;
-                                                    app.status_msg = None;
-                                                }
-                                                Ok(None) => {
-                                                    app.status_msg = Some("Cannot remove playing item".to_string());
-                                                }
-                                                Err(e) => {
-                                                    app.status_msg = Some(format!("Remove failed: {}", e));
-                                                }
-                                            }
-                                            render_details(terminal, &app)?;
-                                        }
-                                    }
-                                    KeyCode::Char('S') => {
-                                        if app.sel_is_playing() {
-                                            app.status_msg = Some("Cannot move playing item".to_string());
-                                            render_details(terminal, &app)?;
-                                        } else if app.pane_order.len() > 1 {
-                                            app.details_mode    = DetailsMode::Send;
-                                            app.send_picker_sel = 0;
-                                            app.status_msg      = None;
-                                            render_details(terminal, &app)?;
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                                continue;
-                            }
-
-                            // -- Normal mode --
-                            match k.code {
-                                KeyCode::Esc => {
-                                    app.show_details = false;
-                                    app.details_mode = DetailsMode::Normal;
-                                    app.status_msg   = None;
-                                    app.jump_input.clear();
-                                    render(terminal, &app)?;
-                                }
-                                KeyCode::Tab => {
-                                    app.details_mode = DetailsMode::Command;
-                                    app.status_msg   = None;
-                                    render_details(terminal, &app)?;
-                                }
-                                KeyCode::Up | KeyCode::Char('k') => {
-                                    app.playlist_sel = app.playlist_sel.saturating_sub(1);
-                                    app.status_msg   = None;
-                                    render_details(terminal, &app)?;
-                                }
-                                KeyCode::Down | KeyCode::Char('j') => {
-                                    if app.playlist_sel + 1 < app.playlist_items.len() {
-                                        app.playlist_sel += 1;
-                                    }
-                                    app.status_msg = None;
-                                    render_details(terminal, &app)?;
-                                }
-                                KeyCode::Char('J') => {
-                                    app.playlist_sel = app.playlist_items.len().saturating_sub(1);
-                                    app.status_msg   = None;
-                                    render_details(terminal, &app)?;
-                                }
-                                KeyCode::Char('g') => {
-                                    app.details_mode = DetailsMode::Jump;
-                                    app.jump_input.clear();
-                                    render_details(terminal, &app)?;
-                                }
-                                KeyCode::Char('n') => {
-                                    app.details_mode    = DetailsMode::Add;
-                                    app.add_input.clear();
-                                    app.add_completions = Vec::new();
-                                    app.add_comp_sel    = 0;
-                                    app.status_msg      = None;
-                                    render_details(terminal, &app)?;
-                                }
-                                KeyCode::Char('C') => {
-                                    if let Some(pane) = app.selected_name() {
-                                        let current_pos = app.current_playlist_pos();
-                                        match m3u_crop(&pane, current_pos) {
-                                            Ok(Some(items)) => {
-                                                app.playlist_items = items;
-                                                app.playlist_sel   = 0;
-                                                reload_playlist_cmd(&mut ws_tx, &pane).await;
-                                                app.status_msg = None;
-                                            }
-                                            Ok(None) => {
-                                                app.status_msg = Some("Nothing playing to crop around".to_string());
-                                            }
-                                            Err(e) => {
-                                                app.status_msg = Some(format!("Crop failed: {}", e));
-                                            }
-                                        }
-                                        render_details(terminal, &app)?;
-                                    }
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        // ================================================================
-                        // DASHBOARD
-                        // ================================================================
-
-                        if app.show_picker {
-                            match k.code {
-                                KeyCode::Char('j') | KeyCode::Down => {
-                                    if app.picker_sel + 1 < app.layouts.len() {
-                                        app.picker_sel += 1;
-                                    }
-                                    render(terminal, &app)?;
-                                }
-                                KeyCode::Char('k') | KeyCode::Up => {
-                                    app.picker_sel = app.picker_sel.saturating_sub(1);
-                                    render(terminal, &app)?;
-                                }
-                                KeyCode::Enter => {
-                                    if let Some(layout) = app.layouts.get(app.picker_sel) {
-                                        let layout = layout.clone();
-                                        send_node_cmd(&mut ws_tx, "panebot:layout",
-                                            serde_json::json!({"layout_name": layout})).await;
-                                        app.show_picker = false;
-                                        render(terminal, &app)?;
-                                    }
-                                }
-                                KeyCode::Esc | KeyCode::Char('W') => {
-                                    app.show_picker = false;
-                                    render(terminal, &app)?;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-
-                        if k.code == KeyCode::Char('W') {
-                            app.picker_sel = app.layouts.iter().position(|l| l == &app.layout).unwrap_or(0);
-                            app.show_picker = true;
+                        Some(Err(_)) | None => {
+                            log_node(&mut app, vec![("connection lost — reconnecting...".to_string(), C_RED)]);
                             render(terminal, &app)?;
-                            continue;
+                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                            continue 'reconnect;
                         }
-
-                        if k.code == KeyCode::Enter {
-                            if let Some(pane) = app.selected_name() {
-                                app.playlist_items = read_m3u(&pane);
-                                app.playlist_sel   = app.panes.get(&pane)
-                                    .map(|p| p.playlist_pos.max(0) as usize)
-                                    .unwrap_or(0);
-                                app.show_details   = true;
-                                app.details_mode   = DetailsMode::Normal;
-                                app.status_msg     = None;
-                                render_details(terminal, &app)?;
-                            }
-                            continue;
-                        }
-
-                        if k.code == KeyCode::Tab {
-                            app.command_mode = !app.command_mode;
-                            render(terminal, &app)?;
-                            continue;
-                        }
-
-                        let shift_l = k.code == KeyCode::Char('L') ||
-                            (k.code == KeyCode::Char('l') && k.modifiers.contains(KeyModifiers::SHIFT));
-                        if shift_l {
-                            app.show_log = !app.show_log;
-                            render(terminal, &app)?;
-                            continue;
-                        }
-
-                        if !app.command_mode {
-                            match k.code {
-                                KeyCode::Char('j') | KeyCode::Down => { app.select_next(); render(terminal, &app)?; continue; }
-                                KeyCode::Char('k') | KeyCode::Up   => { app.select_prev(); render(terminal, &app)?; continue; }
-                                _ => {}
-                            }
-                        }
-
-                        if app.command_mode {
-                            if let Some(pane) = app.selected_name() {
-                                match k.code {
-                                    KeyCode::Char(' ') => { send_cmd(&mut ws_tx, &pane, "cycle",         serde_json::json!(["pause"])).await; }
-                                    KeyCode::Char('m') => { send_cmd(&mut ws_tx, &pane, "cycle",         serde_json::json!(["mute"])).await; }
-                                    KeyCode::Char('j') | KeyCode::Down  => { send_cmd(&mut ws_tx, &pane, "seek", serde_json::json!([-10, "relative"])).await; }
-                                    KeyCode::Char('k') | KeyCode::Up    => { send_cmd(&mut ws_tx, &pane, "seek", serde_json::json!([10,  "relative"])).await; }
-                                    KeyCode::Char('h') | KeyCode::Left  => { send_cmd(&mut ws_tx, &pane, "seek", serde_json::json!([-60, "relative"])).await; }
-                                    KeyCode::Char('l') | KeyCode::Right => { send_cmd(&mut ws_tx, &pane, "seek", serde_json::json!([60,  "relative"])).await; }
-                                    KeyCode::Char('=') => { send_cmd(&mut ws_tx, &pane, "add",           serde_json::json!(["volume",  5])).await; }
-                                    KeyCode::Char('-') => { send_cmd(&mut ws_tx, &pane, "add",           serde_json::json!(["volume", -5.0])).await; }
-                                    KeyCode::Char('n') => { send_cmd(&mut ws_tx, &pane, "playlist-next", serde_json::json!([])).await; }
-                                    KeyCode::Char('N') => { send_cmd(&mut ws_tx, &pane, "playlist-prev", serde_json::json!([])).await; }
-                                    KeyCode::Char('f') => { send_cmd(&mut ws_tx, &pane, "cycle",         serde_json::json!(["fullscreen"])).await; }
-                                    KeyCode::Char('R') => { send_node_cmd(&mut ws_tx, "panebot:restart-pane", serde_json::json!({"pane": pane})).await; }
-                                    _ => {}
-                                }
-                            }
-                        }
+                        _ => {}
                     }
-                    Some(Err(e)) => return Err(e),
-                    None         => break,
-                    _            => {}
+                }
+
+                key = key_events.next() => {
+                    match key {
+                        Some(Ok(Event::Key(k))) => {
+                            match handle_key(&mut app, k, &mut ws_tx).await? {
+                                KeyAction::Quit          => break 'reconnect,
+                                KeyAction::Render        => render(terminal, &app)?,
+                                KeyAction::RenderDetails => {
+                                    if app.show_details { render_details(terminal, &app)?; }
+                                    else                { render(terminal, &app)?;         }
+                                }
+                                KeyAction::Nothing => {}
+                            }
+                        }
+                        Some(Err(e)) => return Err(e),
+                        None         => break 'reconnect,
+                        _            => {}
+                    }
                 }
             }
         }
@@ -1437,7 +1546,13 @@ async fn main() -> io::Result<()> {
     let backend      = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let result = run(&mut terminal).await;
+    let result = async {
+        let addr = match resolve_daemon_addr(&mut terminal).await? {
+            Some(a) => a,
+            None    => return Ok(()),
+        };
+        run(&mut terminal, &addr).await
+    }.await;
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;

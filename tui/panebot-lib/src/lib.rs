@@ -29,20 +29,20 @@ pub fn config_dir() -> PathBuf {
 
 pub fn layouts_dir()     -> PathBuf { config_dir().join("layouts") }
 pub fn panes_conf()      -> PathBuf { config_dir().join("pb.panes.conf") }
-pub fn types_conf()      -> PathBuf { config_dir().join("pb.types.conf") }
-pub fn scripts_lib()     -> PathBuf { config_dir().join("scripts") }
+pub fn hosts_conf()      -> PathBuf { config_dir().join("pb.daemon.conf") }
 pub fn pane_dir(n: &str) -> PathBuf { config_dir().join(n.to_lowercase()) }
+pub fn pane_scripts(n: &str) -> PathBuf { pane_dir(n).join("scripts") }
 
 pub fn pane_socket(n: &str)   -> PathBuf { pane_dir(n).join(format!("{}.sock",     n.to_lowercase())) }
 pub fn pane_mpv_conf(n: &str) -> PathBuf { pane_dir(n).join(format!("{}.mpv.conf", n.to_lowercase())) }
 pub fn pane_playlist(n: &str) -> PathBuf { pane_dir(n).join(format!("{}.m3u",      n.to_lowercase())) }
-pub fn pane_scripts(n: &str)  -> PathBuf { pane_dir(n).join("scripts") }
 
 // ---------------------------------------------------------------------------
 // Structs
 //
 // Pane.geometry removed — geometry is now owned entirely by layout files.
 // Geometry is never stored in panes.conf or on the Pane struct.
+// PaneType removed — type options now live directly in per-pane mpv.conf.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -52,16 +52,71 @@ pub struct Pane {
     pub playlist:  Option<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct PaneType {
-    pub options: Vec<String>,
-    pub scripts: Vec<String>,
-}
-
 #[derive(Debug)]
 pub struct Config {
     pub layout: String,
     pub panes:  Vec<Pane>,
+}
+
+// ---------------------------------------------------------------------------
+// Host — remote daemon entry from pb.daemon.conf
+//
+// pb.daemon.conf format:
+//
+//   # pb.daemon.conf
+//   # Leave empty for local-only mode (connects to 127.0.0.1:9090).
+//
+//   [my-linux-box]
+//   address = ws://192.168.1.x:9090
+//
+//   [studio-display]
+//   address = ws://192.168.1.y:9090
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct Host {
+    pub label:   String,
+    pub address: String,
+}
+
+pub fn load_hosts() -> Vec<Host> {
+    let content = match std::fs::read_to_string(hosts_conf()) {
+        Ok(c)  => c,
+        Err(_) => return Vec::new(),
+    };
+
+    let mut hosts   = Vec::new();
+    let mut label:   Option<String> = None;
+    let mut address: Option<String> = None;
+
+    macro_rules! flush {
+        () => {
+            if let (Some(l), Some(a)) = (label.take(), address.take()) {
+                hosts.push(Host { label: l, address: a });
+            }
+        };
+    }
+
+    for line in content.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+
+        if line.starts_with('[') && line.ends_with(']') {
+            flush!();
+            label   = Some(line[1..line.len()-1].to_string());
+            address = None;
+            continue;
+        }
+
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim();
+            let val = line[eq+1..].trim().to_string();
+            if key == "address" { address = Some(val); }
+        }
+    }
+    flush!();
+
+    hosts
 }
 
 // ---------------------------------------------------------------------------
@@ -131,59 +186,6 @@ pub fn load_config() -> Config {
     flush!();
 
     Config { layout, panes }
-}
-
-// ---------------------------------------------------------------------------
-// Parse pb.types.conf
-// ---------------------------------------------------------------------------
-
-pub fn load_types() -> HashMap<String, PaneType> {
-    let mut types   = HashMap::new();
-    let content = match std::fs::read_to_string(types_conf()) {
-        Ok(c)  => c,
-        Err(_) => return types,
-    };
-
-    let mut current: Option<String> = None;
-    let mut options: Vec<String>    = Vec::new();
-    let mut scripts: Vec<String>    = Vec::new();
-
-    macro_rules! flush {
-        () => {
-            if let Some(ref n) = current {
-                types.insert(n.clone(), PaneType {
-                    options: options.clone(),
-                    scripts: scripts.clone(),
-                });
-            }
-        };
-    }
-
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
-
-        if line.starts_with('[') && line.ends_with(']') {
-            flush!();
-            current = Some(line[1..line.len()-1].to_string());
-            options = Vec::new();
-            scripts = Vec::new();
-            continue;
-        }
-
-        if let Some(eq) = line.find('=') {
-            let key = line[..eq].trim();
-            let val = line[eq+1..].trim().to_string();
-            if key == "scripts" {
-                scripts = val.split(',').map(|s| s.trim().to_string()).collect();
-            } else {
-                options.push(format!("{}={}", key, val));
-            }
-        }
-    }
-    flush!();
-
-    types
 }
 
 // ---------------------------------------------------------------------------
