@@ -22,8 +22,6 @@ use panebot_lib::{
 // ---------------------------------------------------------------------------
 
 const MONITOR_RETRY_MS:     u64 = 500;   // delay between mpv socket connect attempts
-#[cfg(target_os = "linux")]
-const SWAY_SETTLE_MS:       u64 = 500;   // wait for mpv window before swaymsg
 const RESTART_PANE_WAIT_MS: u64 = 3000;  // wait after kill before relaunch
 const RESTART_ALL_WAIT_MS:  u64 = 300;   // wait after killing all before relaunch
 
@@ -33,27 +31,29 @@ const RESTART_ALL_WAIT_MS:  u64 = 300;   // wait after killing all before relaun
 
 const DEFAULT_PANES_CONF: &str = "\
 # pb.panes.conf
-# [panename]
-# type     = video | audio | ytube | rtsp | http
-# playlist = /path/to/playlist.m3u
+# [instance_name]                   — drives directory, socket, mpv.conf. set once, never change.
+# pane_name = My Pane               — display name in TUI and mpv window title. change freely.
+# type      = video                 — label only, shown in TUI, does not affect mpv.
+# playlist  = /path/to/file.m3u    — optional. point mpv at an external playlist or directory.
+#                                     if omitted, panebot uses the pane's own .m3u file.
 
 layout = pb.left.stack
 
 [music]
 type     = video
-playlist = ~/.config/panebot/music/music.m3u
+playlist = ~/premiumize/0video.stash/video.films/toons/
 
 [wide-top]
 type     = video
-playlist = ~/.config/panebot/wide-top/wide-top.m3u
+playlist = ~/premiumize/0video.stash/video.films/
 
 [wide-bottom]
 type     = video
-playlist = ~/.config/panebot/wide-bottom/wide-bottom.m3u
+playlist = ~/premiumize/0video.stash/video.films/
 
 [standard]
 type     = video
-playlist = ~/.config/panebot/standard/standard.m3u
+playlist = ~/premiumize/0video.stash/video.series/
 ";
 
 const DEFAULT_HOSTS_CONF: &str = "\
@@ -69,13 +69,11 @@ const DEFAULT_HOSTS_CONF: &str = "\
 // ---------------------------------------------------------------------------
 // Layout files
 //
-// macOS layouts: [panename] sections with geometry = WxH+X+Y
-//   Passed as --geometry arg to mpv at launch. Never written to mpv.conf.
-//
-// Sway layouts: [panename] sections with swaymsg = <criteria> <commands>
-//   Executed via `swaymsg` after pane launch on Linux.
-//   mpv sets window title to PANENAME (uppercase) — Sway matches on that.
-//   geometry key is ignored on Linux.
+// Layout files live in layouts_dir() as .layout files.
+// Each [pane_name] section has a geometry = WxH+X+Y key.
+// On macOS, geometry is passed as --geometry to mpv at launch.
+// On Linux, window placement is left to the window manager.
+// panebot sets --title=PANE_NAME so the WM can match and place windows.
 // ---------------------------------------------------------------------------
 
 const LAYOUT_LEFT_STACK: &str = "\
@@ -108,42 +106,6 @@ geometry = 650x366+2290+804
 
 [standard]
 geometry = 650x488+2290+1180
-";
-
-const LAYOUT_SWAY_LEFT_STACK: &str = "\
-# panebot layout — pb.sway.left.stack
-# Sway floating layout, left stack.
-# Windows matched by mpv --title=PANENAME (uppercase).
-
-[music]
-swaymsg = [title=\"MUSIC\"] floating enable, resize set 366 366, move position 0 0
-
-[wide-top]
-swaymsg = [title=\"WIDE-TOP\"] floating enable, resize set 650 366, move position 0 374
-
-[wide-bottom]
-swaymsg = [title=\"WIDE-BOTTOM\"] floating enable, resize set 650 366, move position 0 748
-
-[standard]
-swaymsg = [title=\"STANDARD\"] floating enable, resize set 650 488, move position 0 1122
-";
-
-const LAYOUT_SWAY_RIGHT_STACK: &str = "\
-# panebot layout — pb.sway.right.stack
-# Sway floating layout, right stack.
-# Windows matched by mpv --title=PANENAME (uppercase).
-
-[music]
-swaymsg = [title=\"MUSIC\"] floating enable, resize set 366 366, move position 2574 64
-
-[wide-top]
-swaymsg = [title=\"WIDE-TOP\"] floating enable, resize set 650 366, move position 2290 432
-
-[wide-bottom]
-swaymsg = [title=\"WIDE-BOTTOM\"] floating enable, resize set 650 366, move position 2290 804
-
-[standard]
-swaymsg = [title=\"STANDARD\"] floating enable, resize set 650 488, move position 2290 1180
 ";
 
 // ---------------------------------------------------------------------------
@@ -201,22 +163,20 @@ fn bootstrap(log: &mut Logger) -> std::io::Result<panebot_lib::Config> {
 
     write_if_missing(&panes_conf(),  DEFAULT_PANES_CONF)?;
     write_if_missing(&hosts_conf(),  DEFAULT_HOSTS_CONF)?;
-    write_if_missing(&layouts_dir().join("pb.left.stack.layout"),       LAYOUT_LEFT_STACK)?;
-    write_if_missing(&layouts_dir().join("pb.right.stack.layout"),      LAYOUT_RIGHT_STACK)?;
-    write_if_missing(&layouts_dir().join("pb.sway.left.stack.layout"),  LAYOUT_SWAY_LEFT_STACK)?;
-    write_if_missing(&layouts_dir().join("pb.sway.right.stack.layout"), LAYOUT_SWAY_RIGHT_STACK)?;
+    write_if_missing(&layouts_dir().join("pb.left.stack.layout"),  LAYOUT_LEFT_STACK)?;
+    write_if_missing(&layouts_dir().join("pb.right.stack.layout"), LAYOUT_RIGHT_STACK)?;
 
     // Per-pane setup — dirs, mpv.conf stub, empty playlist.
     // load_config() called once here after defaults are written.
     let cfg = load_config();
     for pane in &cfg.panes {
-        std::fs::create_dir_all(pane_dir(&pane.name))?;
-        std::fs::create_dir_all(pane_scripts(&pane.name))?;
+        std::fs::create_dir_all(pane_dir(&pane.mpv_name))?;
+        std::fs::create_dir_all(pane_scripts(&pane.mpv_name))?;
 
-        let mpv_conf = pane_mpv_conf(&pane.name);
+        let mpv_conf = pane_mpv_conf(&pane.mpv_name);
         if !mpv_conf.exists() {
             let mut f = std::fs::File::create(&mpv_conf)?;
-            writeln!(f, "# panebot mpv config — {} [{}]", pane.name, pane.pane_type)?;
+            writeln!(f, "# panebot mpv config — {} [{}]", pane.mpv_name, pane.pane_type)?;
             writeln!(f, "# Edit this file to tune mpv for this pane.")?;
             writeln!(f, "# Required options — panebot depends on these.")?;
             writeln!(f, "force-window=yes")?;
@@ -224,16 +184,17 @@ fn bootstrap(log: &mut Logger) -> std::io::Result<panebot_lib::Config> {
             writeln!(f, "pause=yes")?;
             writeln!(f, "volume=100")?;
             writeln!(f, "mute=yes")?;
-            writeln!(f, "scripts-dir={}", pane_scripts(&pane.name).to_string_lossy())?;
+            writeln!(f, "directory-mode=recursive")?;
+            writeln!(f, "scripts-dir={}", pane_scripts(&pane.mpv_name).to_string_lossy())?;
             writeln!(f)?;
             writeln!(f, "# Add your own mpv options below.")?;
-            log.log(&format!("bootstrap :: {} :: created mpv.conf", pane.name));
+            log.log(&format!("bootstrap :: {} :: created mpv.conf", pane.mpv_name));
         }
 
-        let pl = pane_playlist(&pane.name);
+        let pl = pane_playlist(&pane.mpv_name);
         if !pl.exists() {
-            std::fs::File::create(&pl)?;
-            log.log(&format!("bootstrap :: {} :: created empty playlist", pane.name));
+            std::fs::write(&pl, "#EXTM3U\n")?;
+            log.log(&format!("bootstrap :: {} :: created playlist", pane.mpv_name));
         }
     }
 
@@ -256,7 +217,6 @@ fn bootstrap(log: &mut Logger) -> std::io::Result<panebot_lib::Config> {
 #[derive(Debug, Clone, Default)]
 struct LayoutEntry {
     geometry: Option<String>,
-    swaymsg:  Option<String>,
 }
 
 fn parse_layout(content: &str) -> HashMap<String, LayoutEntry> {
@@ -280,7 +240,6 @@ fn parse_layout(content: &str) -> HashMap<String, LayoutEntry> {
                 let entry = map.entry(current.clone()).or_insert_with(LayoutEntry::default);
                 match key {
                     "geometry" => entry.geometry = Some(val),
-                    "swaymsg"  => entry.swaymsg  = Some(val),
                     _          => {}
                 }
             }
@@ -308,32 +267,38 @@ fn load_layout(name: &str, log: &mut Logger) -> Option<HashMap<String, LayoutEnt
 // ---------------------------------------------------------------------------
 // Launch / kill mpv
 //
-// volume and mute now live in mpv.conf — not passed as launch args.
-// geometry: passed as --geometry=WxH+X+Y on macOS only, at launch time.
-//           Ignored on Linux — Sway positions via swaymsg after launch.
+// volume and mute live in mpv.conf — not passed as launch args.
+// geometry: passed as --geometry=WxH+X+Y on macOS only.
+// On Linux, panebot sets --title= and hands off to the window manager.
 // ---------------------------------------------------------------------------
 
 fn launch_pane(pane: &Pane, geometry: Option<&str>, log: &mut Logger) {
-    let socket   = pane_socket(&pane.name);
-    let mpv_conf = pane_mpv_conf(&pane.name);
-    let playlist = pane_playlist(&pane.name);
+    let socket   = pane_socket(&pane.mpv_name);
+    let mpv_conf = pane_mpv_conf(&pane.mpv_name);
+    let playlist = pane_playlist(&pane.mpv_name);
 
     let mut args: Vec<String> = vec![
         format!("--input-ipc-server={}", socket.to_string_lossy()),
-        format!("--title={}", pane.name.to_uppercase()),
+        format!("--title={}", pane.pane_name.to_uppercase()),
         format!("--include={}", mpv_conf.to_string_lossy()),
     ];
 
     #[cfg(target_os = "macos")]
     if let Some(geo) = geometry {
         args.push(format!("--geometry={}", geo));
-        log.log(&format!("launch :: {} :: geometry={}", pane.name, geo));
+        log.log(&format!("launch :: {} :: geometry={}", pane.mpv_name, geo));
     }
 
     #[cfg(not(target_os = "macos"))]
     let _ = geometry;
 
-    if playlist.exists() && playlist.metadata().map(|m| m.len() > 0).unwrap_or(false) {
+    if let Some(ref external) = pane.playlist {
+        if std::path::Path::new(external).exists() {
+            args.push(format!("--playlist={}", external));
+        } else {
+            args.push("--idle=yes".to_string());
+        }
+    } else if playlist.exists() && playlist.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         args.push(playlist.to_string_lossy().to_string());
     } else {
         args.push("--idle=yes".to_string());
@@ -352,69 +317,60 @@ fn launch_pane(pane: &Pane, geometry: Option<&str>, log: &mut Logger) {
     }
 
     match cmd.spawn() {
-        Ok(_)  => log.log(&format!("launch :: {} :: mpv spawned", pane.name)),
-        Err(e) => log.log(&format!("launch :: {} :: failed to spawn mpv: {}", pane.name, e)),
+        Ok(_)  => log.log(&format!("launch :: {} :: mpv spawned", pane.mpv_name)),
+        Err(e) => log.log(&format!("launch :: {} :: failed to spawn mpv: {}", pane.mpv_name, e)),
     }
 }
 
-#[cfg(target_os = "linux")]
-fn apply_swaymsg(pane_name: &str, msg: &str, log: &mut Logger) {
-    match std::process::Command::new("swaymsg").arg(msg).output() {
-        Ok(out) => {
-            if out.status.success() {
-                log.log(&format!("sway :: {} :: positioned", pane_name));
-            } else {
-                let err = String::from_utf8_lossy(&out.stderr);
-                log.log(&format!("sway :: {} :: swaymsg failed: {}", pane_name, err.trim()));
-            }
-        }
-        Err(e) => log.log(&format!("sway :: {} :: could not run swaymsg: {}", pane_name, e)),
-    }
-}
-
-async fn kill_pane_async(pane_name: &str, log: &mut Logger) {
-    let socket = pane_socket(pane_name).to_string_lossy().to_string();
+async fn kill_pane_async(mpv_name: &str, log: &mut Logger) {
+    let socket = pane_socket(mpv_name).to_string_lossy().to_string();
     match UnixStream::connect(&socket).await {
         Ok(mut stream) => {
             let cmd = serde_json::json!({"command":["quit"]}).to_string() + "\n";
             let _ = stream.write_all(cmd.as_bytes()).await;
-            log.log(&format!("kill :: {} :: quit sent", pane_name));
+            log.log(&format!("kill :: {} :: quit sent", mpv_name));
         }
         Err(_) => {
-            log.log(&format!("kill :: {} :: socket not found, already dead", pane_name));
+            log.log(&format!("kill :: {} :: socket not found, already dead", mpv_name));
         }
     }
 }
 
 // ---------------------------------------------------------------------------
 // Pane state
+//
+// Properties are Option — unknown until mpv reports them via observe_property.
+// Avoids showing wrong state in the window before the first push arrives.
+// online is bool — set directly by the daemon, not derived from mpv.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PaneState {
-    pub name:         String,
+    pub mpv_name:     String,
+    pub pane_name:    String,
     pub pane_type:    String,
     pub online:       bool,
-    pub idle_active:  bool,
-    pub paused:       bool,
-    pub muted:        bool,
-    pub volume:       f64,
-    pub title:        String,
-    pub playlist_pos: i64,
+    pub idle_active:  Option<bool>,
+    pub paused:       Option<bool>,
+    pub muted:        Option<bool>,
+    pub volume:       Option<f64>,
+    pub title:        Option<String>,
+    pub playlist_pos: Option<i64>,
 }
 
 impl PaneState {
-    fn new(name: &str, pane_type: &str) -> Self {
+    fn new(mpv_name: &str, pane_name: &str, pane_type: &str) -> Self {
         PaneState {
-            name:         name.to_string(),
+            mpv_name:     mpv_name.to_string(),
+            pane_name:    pane_name.to_string(),
             pane_type:    pane_type.to_string(),
             online:       false,
-            idle_active:  true,
-            paused:       true,
-            muted:        false,
-            volume:       0.0,
-            title:        String::new(),
-            playlist_pos: -1,
+            idle_active:  None,
+            paused:       None,
+            muted:        None,
+            volume:       None,
+            title:        None,
+            playlist_pos: None,
         }
     }
 }
@@ -435,7 +391,7 @@ async fn monitor_pane(
     tx:    broadcast::Sender<String>,
     cmds:  PaneCommands,
 ) {
-    let socket_path = pane_socket(&pane.name).to_string_lossy().to_string();
+    let socket_path = pane_socket(&pane.mpv_name).to_string_lossy().to_string();
 
     loop {
         // Try to connect. If it fails, mark offline and wait before retrying.
@@ -444,12 +400,12 @@ async fn monitor_pane(
             Err(_) => {
                 {
                     let mut s = state.lock().unwrap();
-                    let ps = s.entry(pane.name.clone())
-                        .or_insert_with(|| PaneState::new(&pane.name, &pane.pane_type));
+                    let ps = s.entry(pane.mpv_name.clone())
+                        .or_insert_with(|| PaneState::new(&pane.mpv_name, &pane.pane_name, &pane.pane_type));
                     if ps.online {
                         ps.online = false;
                         let _ = tx.send(serde_json::json!({
-                            "pane":  pane.name,
+                            "pane":  pane.mpv_name,
                             "event": "offline"
                         }).to_string());
                     }
@@ -461,7 +417,7 @@ async fn monitor_pane(
 
         // Fresh channel on each reconnect — fixes consumed cmd_rx bug
         let (cmd_tx, cmd_rx) = mpsc::channel::<String>(32);
-        cmds.lock().unwrap().insert(pane.name.clone(), cmd_tx);
+        cmds.lock().unwrap().insert(pane.mpv_name.clone(), cmd_tx);
 
         let (read_half, mut write_half) = tokio::io::split(stream);
         let mut reader = BufReader::new(read_half);
@@ -491,19 +447,20 @@ async fn monitor_pane(
 
         {
             let mut s = state.lock().unwrap();
-            let ps = s.entry(pane.name.clone())
-                .or_insert_with(|| PaneState::new(&pane.name, &pane.pane_type));
+            let ps = s.entry(pane.mpv_name.clone())
+                .or_insert_with(|| PaneState::new(&pane.mpv_name, &pane.pane_name, &pane.pane_type));
             ps.online = true;
             let _ = tx.send(serde_json::json!({
-                "pane":  pane.name,
+                "pane":  pane.mpv_name,
                 "event": "online"
             }).to_string());
         }
 
-        let pane_name = pane.name.clone();
-        let pane_type = pane.pane_type.clone();
-        let state_r   = state.clone();
-        let tx_r      = tx.clone();
+        let mpv_name          = pane.mpv_name.clone();
+        let pane_display_name = pane.pane_name.clone();
+        let pane_type         = pane.pane_type.clone();
+        let state_r           = state.clone();
+        let tx_r              = tx.clone();
 
         let read_task = tokio::spawn(async move {
             let mut line = String::new();
@@ -522,21 +479,21 @@ async fn monitor_pane(
                 if v["event"] == "property-change" {
                     let prop  = v["name"].as_str().unwrap_or("").to_string();
                     let mut s = state_r.lock().unwrap();
-                    let ps    = s.entry(pane_name.clone())
-                        .or_insert_with(|| PaneState::new(&pane_name, &pane_type));
+                    let ps    = s.entry(mpv_name.clone())
+                        .or_insert_with(|| PaneState::new(&mpv_name, &pane_display_name, &pane_type));
 
                     match prop.as_str() {
-                        "pause"        => { ps.paused       = v["data"].as_bool().unwrap_or(true); }
-                        "volume"       => { ps.volume       = v["data"].as_f64().unwrap_or(0.0); }
-                        "media-title"  => { ps.title        = v["data"].as_str().unwrap_or("").to_string(); }
-                        "playlist-pos" => { ps.playlist_pos = v["data"].as_i64().unwrap_or(-1); }
-                        "mute"         => { ps.muted        = v["data"].as_bool().unwrap_or(false); }
-                        "idle-active"  => { ps.idle_active  = v["data"].as_bool().unwrap_or(true); }
+                        "pause"        => { ps.paused       = v["data"].as_bool(); }
+                        "volume"       => { ps.volume       = v["data"].as_f64(); }
+                        "media-title"  => { ps.title        = v["data"].as_str().map(|s| s.to_string()); }
+                        "playlist-pos" => { ps.playlist_pos = v["data"].as_i64(); }
+                        "mute"         => { ps.muted        = v["data"].as_bool(); }
+                        "idle-active"  => { ps.idle_active  = v["data"].as_bool(); }
                         _ => continue,
                     }
 
                     let _ = tx_r.send(serde_json::json!({
-                        "pane":     pane_name,
+                        "pane":     mpv_name,
                         "event":    "property-change",
                         "property": prop,
                         "value":    v["data"],
@@ -562,11 +519,11 @@ async fn monitor_pane(
 
         {
             let mut s = state.lock().unwrap();
-            if let Some(ps) = s.get_mut(&pane.name) {
+            if let Some(ps) = s.get_mut(&pane.mpv_name) {
                 ps.online = false;
             }
             let _ = tx.send(serde_json::json!({
-                "pane":  pane.name,
+                "pane":  pane.mpv_name,
                 "event": "offline"
             }).to_string());
         }
@@ -602,7 +559,7 @@ async fn handle_ws(
     let state_msgs: Vec<String> = {
         let s = state.lock().unwrap();
         s.values().map(|ps| serde_json::json!({
-            "pane":  ps.name,
+            "pane":  ps.mpv_name,
             "event": if ps.online { "online" } else { "offline" },
             "state": ps,
         }).to_string()).collect()
@@ -722,7 +679,7 @@ async fn handle_node_command(
 ) {
     match cmd {
 
-        "panebot:node-info" => {
+        "panebot:node-info" | "panebot:node-status" => {
             let s     = state.lock().unwrap();
             let ps: Vec<&PaneState> = s.values().collect();
             let _ = tx.send(serde_json::json!({
@@ -733,64 +690,35 @@ async fn handle_node_command(
             }).to_string());
         }
 
-        "panebot:node-status" => {
-            let s     = state.lock().unwrap();
-            let ps: Vec<&PaneState> = s.values().collect();
-            let _ = tx.send(serde_json::json!({
-                "event": "node:status",
-                "panes": ps,
-            }).to_string());
-        }
-
         "panebot:restart-all" => {
             let mut log      = Logger::open().unwrap();
             let layout_name  = layout.lock().unwrap().clone();
             let layout_map   = load_layout(&layout_name, &mut log);
             for pane in panes.iter() {
-                kill_pane_async(&pane.name, &mut log).await;
+                kill_pane_async(&pane.mpv_name, &mut log).await;
             }
             tokio::time::sleep(Duration::from_millis(RESTART_ALL_WAIT_MS)).await;
             for pane in panes.iter() {
                 let geo = layout_map.as_ref()
-                    .and_then(|m| m.get(&pane.name))
+                    .and_then(|m| m.get(&pane.mpv_name))
                     .and_then(|e| e.geometry.as_deref());
                 launch_pane(pane, geo, &mut log);
-            }
-            #[cfg(target_os = "linux")]
-            if let Some(ref lmap) = layout_map {
-                tokio::time::sleep(Duration::from_millis(SWAY_SETTLE_MS)).await;
-                for pane in panes.iter() {
-                    if let Some(entry) = lmap.get(&pane.name) {
-                        if let Some(msg) = &entry.swaymsg {
-                            apply_swaymsg(&pane.name, msg, &mut log);
-                        }
-                    }
-                }
             }
             let _ = tx.send(serde_json::json!({"event":"node:restart-all"}).to_string());
         }
 
         "panebot:restart-pane" => {
             let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
-            if let Some(pane) = panes.iter().find(|p| p.name == pane_name) {
+            if let Some(pane) = panes.iter().find(|p| p.mpv_name == pane_name) {
                 let mut log     = Logger::open().unwrap();
                 let layout_name = layout.lock().unwrap().clone();
                 let layout_map  = load_layout(&layout_name, &mut log);
-                kill_pane_async(&pane.name, &mut log).await;
+                kill_pane_async(&pane.mpv_name, &mut log).await;
                 tokio::time::sleep(Duration::from_millis(RESTART_PANE_WAIT_MS)).await;
                 let geo = layout_map.as_ref()
-                    .and_then(|m| m.get(&pane.name))
+                    .and_then(|m| m.get(&pane.mpv_name))
                     .and_then(|e| e.geometry.as_deref());
                 launch_pane(pane, geo, &mut log);
-                #[cfg(target_os = "linux")]
-                if let Some(ref lmap) = layout_map {
-                    tokio::time::sleep(Duration::from_millis(SWAY_SETTLE_MS)).await;
-                    if let Some(entry) = lmap.get(&pane.name) {
-                        if let Some(msg) = &entry.swaymsg {
-                            apply_swaymsg(&pane.name, msg, &mut log);
-                        }
-                    }
-                }
                 let _ = tx.send(serde_json::json!({
                     "event": "node:restart-pane",
                     "pane":  pane_name,
@@ -819,27 +747,15 @@ async fn handle_node_command(
                 log.log(&format!("layout :: switching to {} — restarting {} panes", layout_name, panes.len()));
 
                 for pane in panes.iter() {
-                    kill_pane_async(&pane.name, &mut log).await;
+                    kill_pane_async(&pane.mpv_name, &mut log).await;
                 }
 
                 tokio::time::sleep(Duration::from_millis(RESTART_ALL_WAIT_MS)).await;
 
                 for pane in panes.iter() {
-                    let geo = layout_map.get(&pane.name)
+                    let geo = layout_map.get(&pane.mpv_name)
                         .and_then(|e| e.geometry.as_deref());
                     launch_pane(pane, geo, &mut log);
-                }
-
-                #[cfg(target_os = "linux")]
-                {
-                    tokio::time::sleep(Duration::from_millis(SWAY_SETTLE_MS)).await;
-                    for pane in panes.iter() {
-                        if let Some(entry) = layout_map.get(&pane.name) {
-                            if let Some(msg) = &entry.swaymsg {
-                                apply_swaymsg(&pane.name, msg, &mut log);
-                            }
-                        }
-                    }
                 }
 
                 let _ = tx.send(serde_json::json!({
@@ -875,20 +791,25 @@ async fn handle_node_command(
 // ---------------------------------------------------------------------------
 
 fn hostname() -> String {
+    // /etc/hostname is Linux-specific. Use std::env or gethostname via std on all platforms.
+    #[cfg(target_os = "linux")]
     if let Ok(h) = std::fs::read_to_string("/etc/hostname") {
         let h = h.trim().to_string();
         if !h.is_empty() { return h; }
     }
+
+    // HOSTNAME env var works on most unix shells
     if let Ok(h) = std::env::var("HOSTNAME") {
+        let h = h.trim().to_string();
         if !h.is_empty() { return h; }
     }
-    if let Ok(h) = std::env::var("HOST") {
-        if !h.is_empty() { return h; }
-    }
+
+    // Fallback — hostname binary, works on macOS and Linux
     if let Ok(out) = std::process::Command::new("hostname").output() {
         let h = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !h.is_empty() { return h; }
     }
+
     "unknown".to_string()
 }
 
@@ -938,35 +859,16 @@ async fn main() {
     let layout_map = load_layout(&cfg.layout, &mut log);
 
     // Launch only panes that are not already running
-    let mut freshly_launched: Vec<String> = Vec::new();
     for pane in &cfg.panes {
-        let socket_path = pane_socket(&pane.name);
+        let socket_path = pane_socket(&pane.mpv_name);
         let already_running = UnixStream::connect(&socket_path).await.is_ok();
         if already_running {
-            log.log(&format!("launch :: {} :: already running", pane.name));
+            log.log(&format!("launch :: {} :: already running", pane.mpv_name));
         } else {
             let geo = layout_map.as_ref()
-                .and_then(|m| m.get(&pane.name))
+                .and_then(|m| m.get(&pane.mpv_name))
                 .and_then(|e| e.geometry.as_deref());
             launch_pane(pane, geo, &mut log);
-            freshly_launched.push(pane.name.clone());
-        }
-    }
-
-    // On Linux/Sway: position freshly launched panes via swaymsg
-    #[cfg(target_os = "linux")]
-    if let Some(ref lmap) = layout_map {
-        if !freshly_launched.is_empty() {
-            tokio::time::sleep(Duration::from_millis(SWAY_SETTLE_MS)).await;
-            for pane in &cfg.panes {
-                if freshly_launched.contains(&pane.name) {
-                    if let Some(entry) = lmap.get(&pane.name) {
-                        if let Some(msg) = &entry.swaymsg {
-                            apply_swaymsg(&pane.name, msg, &mut log);
-                        }
-                    }
-                }
-            }
         }
     }
 
@@ -975,8 +877,10 @@ async fn main() {
         "hostname": hostname(),
         "platform": platform(),
         "layout":   cfg.layout,
+        "home":     cfg.home,
         "panes":    cfg.panes.iter().map(|p| serde_json::json!({
-            "name":      p.name,
+            "name":      p.mpv_name,
+            "pane_name": p.pane_name,
             "pane_type": p.pane_type,
         })).collect::<Vec<_>>(),
     }).to_string();
@@ -1007,13 +911,15 @@ async fn main() {
     let do_cleanup = move |log: &mut Logger| {
         log.log("panebot-daemon :: cleaning up stale socket files");
         for pane in cleanup_panes.iter() {
-            let path = pane_socket(&pane.name);
+            let path = pane_socket(&pane.mpv_name);
             if path.exists() {
-                // Only remove if nothing is listening — mpv may still be running
+                #[cfg(unix)]
                 let alive = std::os::unix::net::UnixStream::connect(&path).is_ok();
+                #[cfg(not(unix))]
+                let alive = false;
                 if !alive {
                     let _ = std::fs::remove_file(&path);
-                    log.log(&format!("cleanup :: {} :: stale socket removed", pane.name));
+                    log.log(&format!("cleanup :: {} :: stale socket removed", pane.mpv_name));
                 }
             }
         }

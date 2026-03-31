@@ -12,14 +12,14 @@ use ratatui::{
     widgets::{List, ListItem, Paragraph},
     Terminal,
 };
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use panebot_lib::{
-    layouts_dir, pane_playlist, read_m3u, m3u_append, m3u_remove, m3u_crop,
-    load_hosts, Host,
+    layouts_dir, pane_playlist, read_m3u, write_m3u, m3u_append, m3u_remove, m3u_crop,
+    save_playlist, home_dir, config_dir, load_hosts, Host,
 };
 
 // ---------------------------------------------------------------------------
@@ -27,7 +27,6 @@ use panebot_lib::{
 // ---------------------------------------------------------------------------
 
 const LOCAL_ADDR:        &str  = "ws://127.0.0.1:9090";
-const LOG_CAPACITY:     usize  = 500;
 const CONNECT_RETRY_MS:  u64   = 500;
 const CONNECT_TIMEOUT_S: u64   = 30;
 
@@ -62,44 +61,48 @@ type WsSink = futures_util::stream::SplitSink<
 
 #[derive(Debug, Clone)]
 struct PaneState {
-    #[allow(dead_code)]
-    name:         String,
+    mpv_name:     String,          // instance name — internal, drives paths
+    pane_name:    String,          // display name — TUI and window title
     pane_type:    String,
     online:       bool,
-    idle_active:  bool,
-    paused:       bool,
-    muted:        bool,
-    volume:       f64,
-    title:        String,
-    playlist_pos: i64,
+    idle_active:  Option<bool>,
+    paused:       Option<bool>,
+    muted:        Option<bool>,
+    volume:       Option<f64>,
+    title:        Option<String>,
+    playlist_pos: Option<i64>,
 }
 
 impl PaneState {
-    fn new(name: &str, pane_type: &str) -> Self {
+    fn new(mpv_name: &str, pane_name: &str, pane_type: &str) -> Self {
         PaneState {
-            name:         name.to_string(),
+            mpv_name:     mpv_name.to_string(),
+            pane_name:    pane_name.to_string(),
             pane_type:    pane_type.to_string(),
             online:       false,
-            idle_active:  true,
-            paused:       true,
-            muted:        false,
-            volume:       0.0,
-            title:        String::new(),
-            playlist_pos: -1,
+            idle_active:  None,
+            paused:       None,
+            muted:        None,
+            volume:       None,
+            title:        None,
+            playlist_pos: None,
         }
     }
 
     fn playback_label(&self) -> (&'static str, Color) {
-        if !self.online     { return ("Offline", C_RED);  }
-        if self.idle_active { return ("Stopped", C_DIM);  }
-        if self.paused      { return ("Paused",  C_HINT); }
+        if !self.online                              { return ("Offline", C_RED);  }
+        if self.idle_active.unwrap_or(true)         { return ("Stopped", C_DIM);  }
+        if self.paused.unwrap_or(true)              { return ("Paused",  C_HINT); }
         ("Playing", C_GREEN)
     }
 
     fn volume_label(&self) -> (String, Color) {
-        if !self.online { return ("Offline".to_string(), C_RED); }
-        if self.muted   { return ("Vol:Mute".to_string(), C_DIM); }
-        (format!("Vol:{:3.0}", self.volume), C_CYAN)
+        if !self.online                    { return ("Offline".to_string(),  C_RED); }
+        if self.muted.unwrap_or(false)     { return ("Vol:Mute".to_string(), C_DIM); }
+        match self.volume {
+            Some(v) => (format!("Vol:{:3.0}", v), C_CYAN),
+            None    => ("Vol:  ?".to_string(),    C_DIM),
+        }
     }
 }
 
@@ -110,73 +113,63 @@ impl PaneState {
 #[derive(Debug, Clone, PartialEq)]
 enum DetailsMode {
     Normal,
-    Command,
     Jump,
     Add,
-    Send,
 }
 
 // ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
-struct LogLine {
-    spans: Vec<(String, Color)>,
-}
-
 struct App {
-    pane_order:      Vec<String>,
-    panes:           HashMap<String, PaneState>,
-    selected:        usize,
-    hostname:        String,
-    platform:        String,
-    layout:          String,
-    log:             VecDeque<LogLine>,
-    show_log:        bool,
-    command_mode:    bool,
-    show_picker:     bool,
-    picker_sel:      usize,
-    layouts:         Vec<String>,
-    show_details:    bool,
-    details_mode:    DetailsMode,
-    playlist_sel:    usize,
-    playlist_items:  Vec<String>,
-    status_msg:      Option<String>,
-    jump_input:      String,
-    add_input:       String,
-    send_picker_sel: usize,
+    pane_order:     Vec<String>,
+    panes:          HashMap<String, PaneState>,
+    selected:       usize,
+    hostname:       String,
+    platform:       String,
+    layout:         String,
+    home:           String,
+    owns_daemon:    bool,
+    show_log:       bool,
+    command_mode:   bool,
+    show_picker:    bool,
+    picker_sel:     usize,
+    layouts:        Vec<String>,
+    show_details:   bool,
+    details_mode:   DetailsMode,
+    playlist_sel:   usize,
+    playlist_items: Vec<String>,
+    selected_items: HashSet<usize>,
+    status_msg:     Option<String>,
+    jump_input:     String,
+    add_input:      String,
 }
 
 impl App {
     fn new() -> Self {
         App {
-            pane_order:      Vec::new(),
-            panes:           HashMap::new(),
-            selected:        0,
-            hostname:        String::new(),
-            platform:        String::new(),
-            layout:          String::new(),
-            log:             VecDeque::with_capacity(LOG_CAPACITY),
-            show_log:        false,
-            command_mode:    false,
-            show_picker:     false,
-            picker_sel:      0,
-            layouts:         Vec::new(),
-            show_details:    false,
-            details_mode:    DetailsMode::Normal,
-            playlist_sel:    0,
-            playlist_items:  Vec::new(),
-            status_msg:      None,
-            jump_input:      String::new(),
-            add_input:       String::new(),
-            send_picker_sel: 0,
+            pane_order:     Vec::new(),
+            panes:          HashMap::new(),
+            selected:       0,
+            hostname:       String::new(),
+            platform:       String::new(),
+            layout:         String::new(),
+            home:           home_dir(),
+            owns_daemon:    false,
+            show_log:       false,
+            command_mode:   false,
+            show_picker:    false,
+            picker_sel:     0,
+            layouts:        Vec::new(),
+            show_details:   false,
+            details_mode:   DetailsMode::Normal,
+            playlist_sel:   0,
+            playlist_items: Vec::new(),
+            selected_items: HashSet::new(),
+            status_msg:     None,
+            jump_input:     String::new(),
+            add_input:      String::new(),
         }
-    }
-
-    fn push_log(&mut self, spans: Vec<(String, Color)>) {
-        if self.log.len() >= LOG_CAPACITY { self.log.pop_front(); }
-        self.log.push_back(LogLine { spans });
     }
 
     fn active_count(&self) -> usize {
@@ -202,7 +195,7 @@ impl App {
     fn current_playlist_pos(&self) -> i64 {
         self.selected_name()
             .and_then(|n| self.panes.get(&n))
-            .map(|p| p.playlist_pos)
+            .and_then(|p| p.playlist_pos)
             .unwrap_or(-1)
     }
 
@@ -233,32 +226,6 @@ impl App {
 }
 
 // ---------------------------------------------------------------------------
-// Log helpers
-// ---------------------------------------------------------------------------
-
-fn log_event(app: &mut App, pane: &str, spans: Vec<(String, Color)>) {
-    let mut line = vec![
-        ("[PaneBot]".to_string(),                C_ORANGE),
-        (" :: ".to_string(),                     C_DIM),
-        (format!("{:<12}", pane.to_uppercase()), C_WHITE),
-        (" :: ".to_string(),                     C_DIM),
-    ];
-    line.extend(spans);
-    app.push_log(line);
-}
-
-fn log_node(app: &mut App, spans: Vec<(String, Color)>) {
-    let mut line = vec![
-        ("[PaneBot]".to_string(), C_ORANGE),
-        (" :: ".to_string(),      C_DIM),
-        ("node".to_string(),      C_DIM),
-        (" :: ".to_string(),      C_DIM),
-    ];
-    line.extend(spans);
-    app.push_log(line);
-}
-
-// ---------------------------------------------------------------------------
 // WS event processing
 // ---------------------------------------------------------------------------
 
@@ -274,39 +241,33 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
             app.hostname = v["hostname"].as_str().unwrap_or("").to_string();
             app.platform = v["platform"].as_str().unwrap_or("").to_string();
             app.layout   = v["layout"].as_str().unwrap_or("").to_string();
+            app.home     = v["home"].as_str().unwrap_or("").to_string();
             app.load_layouts();
 
             if let Some(panes) = v["panes"].as_array() {
                 for p in panes {
-                    let name  = p["name"].as_str().unwrap_or("").to_string();
-                    let ptype = p["pane_type"].as_str().unwrap_or("video").to_string();
-                    if !name.is_empty() && !app.pane_order.contains(&name) {
-                        app.pane_order.push(name.clone());
-                        app.panes.insert(name.clone(), PaneState::new(&name, &ptype));
+                    let mpv_name  = p["name"].as_str().unwrap_or("").to_string();
+                    let pane_name = p["pane_name"].as_str().unwrap_or(mpv_name.as_str()).to_string();
+                    let ptype     = p["pane_type"].as_str().unwrap_or("video").to_string();
+                    if !mpv_name.is_empty() {
+                        app.pane_order.push(mpv_name.clone());
+                        app.panes.insert(mpv_name.clone(), PaneState::new(&mpv_name, &pane_name, &ptype));
                     }
                 }
             }
         }
 
         "online" => {
-            let pane        = v["pane"].as_str().unwrap_or("");
-            let was_offline = app.panes.get(pane).map(|p| !p.online).unwrap_or(false);
+            let pane = v["pane"].as_str().unwrap_or("");
             if let Some(ps) = app.panes.get_mut(pane) {
                 ps.online = true;
                 if let Some(state) = v.get("state") { apply_state(ps, state); }
             }
-            if was_offline {
-                log_event(app, pane, vec![("Online".to_string(), C_GREEN)]);
-            }
         }
 
         "offline" => {
-            let pane       = v["pane"].as_str().unwrap_or("");
-            let was_online = app.panes.get(pane).map(|p| p.online).unwrap_or(false);
+            let pane = v["pane"].as_str().unwrap_or("");
             if let Some(ps) = app.panes.get_mut(pane) { ps.online = false; }
-            if was_online {
-                log_event(app, pane, vec![("Offline".to_string(), C_RED)]);
-            }
         }
 
         "property-change" => {
@@ -314,78 +275,26 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
             let prop = v["property"].as_str().unwrap_or("");
             if let Some(ps) = app.panes.get_mut(pane) {
                 match prop {
-                    "pause"        => { ps.paused       = v["value"].as_bool().unwrap_or(true); }
-                    "volume"       => { ps.volume       = v["value"].as_f64().unwrap_or(0.0); }
-                    "media-title"  => { ps.title        = v["value"].as_str().unwrap_or("").to_string(); }
-                    "playlist-pos" => { ps.playlist_pos = v["value"].as_i64().unwrap_or(-1); }
-                    "mute"         => { ps.muted        = v["value"].as_bool().unwrap_or(false); }
-                    "idle-active"  => { ps.idle_active  = v["value"].as_bool().unwrap_or(true); }
+                    "pause"        => { ps.paused       = v["value"].as_bool(); }
+                    "volume"       => { ps.volume       = v["value"].as_f64(); }
+                    "media-title"  => { ps.title        = v["value"].as_str().map(|s| s.to_string()); }
+                    "playlist-pos" => { ps.playlist_pos = v["value"].as_i64(); }
+                    "mute"         => { ps.muted        = v["value"].as_bool(); }
+                    "idle-active"  => { ps.idle_active  = v["value"].as_bool(); }
                     _ => {}
                 }
-            }
-            match prop {
-                "volume" => {
-                    let vol = v["value"].as_f64().unwrap_or(0.0);
-                    log_event(app, pane, vec![
-                        ("volume".to_string(), C_DIM),
-                        (" :: ".to_string(),   C_DIM),
-                        (format!("{:.0}", vol), C_CYAN),
-                    ]);
-                }
-                "media-title" => {
-                    let title = v["value"].as_str().unwrap_or("-").to_string();
-                    log_event(app, pane, vec![
-                        ("title".to_string(), C_DIM),
-                        (" :: ".to_string(),  C_DIM),
-                        (title,               C_CYAN),
-                    ]);
-                }
-                "pause" => {
-                    let paused = v["value"].as_bool().unwrap_or(true);
-                    log_event(app, pane, vec![(
-                        if paused { "Paused".to_string()  } else { "Playing".to_string() },
-                        if paused { C_HINT               } else { C_GREEN               },
-                    )]);
-                }
-                "mute" => {
-                    let muted = v["value"].as_bool().unwrap_or(false);
-                    log_event(app, pane, vec![(
-                        if muted { "Muted".to_string() } else { "Unmuted".to_string() },
-                        C_DIM,
-                    )]);
-                }
-                _ => {}
             }
         }
 
         "node:down" => {
-            let reason = v["reason"].as_str().unwrap_or("unknown");
-            log_node(app, vec![
-                ("node:down".to_string(), C_RED),
-                (" :: ".to_string(),      C_DIM),
-                (reason.to_string(),      C_ORANGE),
-            ]);
             for ps in app.panes.values_mut() { ps.online = false; }
             return Some("node:down");
         }
 
         "node:layout" => {
-            let layout = v["layout"].as_str().unwrap_or("unknown");
-            app.layout = layout.to_string();
-            log_node(app, vec![
-                ("layout".to_string(), C_DIM),
-                (" :: ".to_string(),   C_DIM),
-                (layout.to_string(),   C_CYAN),
-            ]);
-        }
-
-        "node:restart-pane" => {
-            let pane = v["pane"].as_str().unwrap_or("unknown");
-            log_event(app, pane, vec![("restarting".to_string(), C_ORANGE)]);
-        }
-
-        "node:restart-all" => {
-            log_node(app, vec![("restart-all".to_string(), C_ORANGE)]);
+            if let Some(layout) = v["layout"].as_str() {
+                app.layout = layout.to_string();
+            }
         }
 
         _ => {}
@@ -395,12 +304,12 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
 }
 
 fn apply_state(ps: &mut PaneState, state: &serde_json::Value) {
-    if let Some(v) = state["paused"].as_bool()      { ps.paused       = v; }
-    if let Some(v) = state["muted"].as_bool()        { ps.muted        = v; }
-    if let Some(v) = state["idle_active"].as_bool()  { ps.idle_active  = v; }
-    if let Some(v) = state["volume"].as_f64()        { ps.volume       = v; }
-    if let Some(v) = state["playlist_pos"].as_i64()  { ps.playlist_pos = v; }
-    if let Some(v) = state["title"].as_str()         { ps.title        = v.to_string(); }
+    if let Some(v) = state["paused"].as_bool()      { ps.paused       = Some(v); }
+    if let Some(v) = state["muted"].as_bool()        { ps.muted        = Some(v); }
+    if let Some(v) = state["idle_active"].as_bool()  { ps.idle_active  = Some(v); }
+    if let Some(v) = state["volume"].as_f64()        { ps.volume       = Some(v); }
+    if let Some(v) = state["playlist_pos"].as_i64()  { ps.playlist_pos = Some(v); }
+    if let Some(v) = state["title"].as_str()         { ps.title        = Some(v.to_string()); }
 }
 
 // ---------------------------------------------------------------------------
@@ -500,19 +409,23 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
 
         if app.show_log {
             let log_height = chunks[2].height as usize;
-            let log_items: Vec<ListItem> = app.log.iter()
+            let log_path   = config_dir().join("panebot-daemon.log");
+            let log_lines: Vec<ListItem> = std::fs::read_to_string(&log_path)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>()
+                .into_iter()
                 .rev()
                 .take(log_height)
+                .collect::<Vec<_>>()
+                .into_iter()
                 .rev()
-                .map(|line| ListItem::new(Line::from(
-                    line.spans.iter()
-                        .map(|(t, c)| Span::styled(t.clone(), Style::default().fg(*c)))
-                        .collect::<Vec<_>>()
-                )))
+                .map(|line| ListItem::new(Span::styled(line, Style::default().fg(C_DIM))))
                 .collect();
-            f.render_widget(List::new(log_items), chunks[2]);
+            f.render_widget(List::new(log_lines), chunks[2]);
         } else {
-            let max_name = app.pane_order.iter().map(|n| n.len() + 2).max().unwrap_or(8);
+            let max_name = app.panes.values().map(|p| p.pane_name.len() + 2).max().unwrap_or(8);
             let max_type = app.panes.values().map(|p| p.pane_type.len()).max().unwrap_or(5);
 
             let items: Vec<ListItem> = app.pane_order.iter().enumerate().map(|(i, name)| {
@@ -527,7 +440,7 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 };
 
                 let name_span = Span::styled(
-                    format!("{:<width$}", format!("\"{}\"", name.to_uppercase()), width = max_name),
+                    format!("{:<width$}", format!("\"{}\"", ps.map(|p| p.pane_name.to_uppercase()).unwrap_or_else(|| name.to_uppercase())), width = max_name),
                     Style::default().fg(C_WHITE).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
                 );
 
@@ -542,7 +455,7 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 let (vol_str, vol_color) = ps.map(|p| p.volume_label()).unwrap_or_else(|| ("Offline".to_string(), C_RED));
                 let vol_span = Span::styled(format!("[{:8}]", vol_str), Style::default().fg(vol_color));
 
-                let title_str = ps.map(|p| if p.title.is_empty() { "-".to_string() } else { p.title.clone() }).unwrap_or_else(|| "-".to_string());
+                let title_str = ps.map(|p| p.title.as_deref().filter(|s| !s.is_empty()).unwrap_or("-").to_string()).unwrap_or_else(|| "-".to_string());
                 let title_span = Span::styled(title_str, Style::default().fg(C_CYAN));
 
                 let cmd_badge = if is_sel && app.command_mode {
@@ -604,51 +517,63 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
 
         let footer = if app.command_mode {
             Line::from(vec![
-                Span::styled("[CMD]",     Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[Space]",   Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Play",     Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[m]",       Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Mute",     Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[up/dn]",   Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" 10s",      Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[lt/rt]",   Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" 1m",       Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[=/–]",     Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Vol",      Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[n/N]",     Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Skip",     Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[f]",       Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Full",     Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[R]",       Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Relaunch", Style::default()),
-                Span::styled(" :: ",      Style::default()),
-                Span::styled("[Tab]",     Style::default().add_modifier(Modifier::BOLD)),
-                Span::styled(" Close",    Style::default()),
+                Span::styled("[CMD]",    Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[Space]",  Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Pause",   Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[m]",      Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Mute",    Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[↵]",     Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Next",    Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[h/l]",    Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" ±5s",     Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[j/k]",    Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" ±60s",    Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[9/0]",    Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Vol",     Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[f]",      Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Full",    Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[v]",      Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Adv",     Style::default()),
+                Span::styled(" :: ",     Style::default()),
+                Span::styled("[Tab]",    Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled(" Close",   Style::default()),
             ])
         } else {
             Line::from(vec![
-                Span::styled("[up/dn]",  Style::default().fg(C_DIM)),
-                Span::styled(" Select",  Style::default().fg(C_DIM)),
-                Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
-                Span::styled("[Tab]",    Style::default().fg(C_DIM)),
-                Span::styled(" Command", Style::default().fg(C_DIM)),
-                Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
-                Span::styled("[L]",      Style::default().fg(C_DIM)),
-                Span::styled(" Log",     Style::default().fg(C_DIM)),
-                Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
-                Span::styled("[W]",      Style::default().fg(C_DIM)),
-                Span::styled(" Layout",  Style::default().fg(C_DIM)),
-                Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
-                Span::styled("[q]",      Style::default().fg(C_DIM)),
-                Span::styled(" Quit",    Style::default().fg(C_DIM)),
+                Span::styled("[j/k]",   Style::default().fg(C_DIM)),
+                Span::styled(" Nav",    Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[↵]",    Style::default().fg(C_DIM)),
+                Span::styled(" Detail", Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[r/R]",   Style::default().fg(C_DIM)),
+                Span::styled(" Restart",Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[S]",     Style::default().fg(C_DIM)),
+                Span::styled(" Solo",   Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[M]",     Style::default().fg(C_DIM)),
+                Span::styled(" Mute∅",  Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[X/P]",   Style::default().fg(C_DIM)),
+                Span::styled(" Stp/Ply",Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[W]",     Style::default().fg(C_DIM)),
+                Span::styled(" Layout", Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[L]",     Style::default().fg(C_DIM)),
+                Span::styled(" Log",    Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[q]",     Style::default().fg(C_DIM)),
+                Span::styled(" Quit",   Style::default().fg(C_DIM)),
             ])
         };
 
@@ -715,7 +640,7 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
         f.render_widget(Paragraph::new(Line::from(vec![
             Span::styled("[PaneBot]", Style::default().fg(C_ORANGE)),
             sep.clone(),
-            Span::styled(format!("\"{}\"", pane_name.to_uppercase()), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("\"{}\"", ps.map(|p| p.pane_name.to_uppercase()).unwrap_or_else(|| pane_name.to_uppercase())), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
             sep.clone(),
             Span::styled(
                 format!("[{}]", ps.map(|p| p.pane_type.to_uppercase()).unwrap_or_else(|| "?".to_string())),
@@ -742,9 +667,10 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             .skip(scroll_off)
             .take(list_height)
             .map(|(i, entry)| {
-                let is_current = i as i64 == current_pos;
-                let is_sel     = i == app.playlist_sel;
-                let display    = {
+                let is_current  = i as i64 == current_pos;
+                let is_sel      = i == app.playlist_sel;
+                let is_marked   = app.selected_items.contains(&i);
+                let display     = {
                     let t = entry.trim_end_matches('/');
                     t.split('/').last().unwrap_or(entry.as_str())
                 };
@@ -757,12 +683,14 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
 
                 let now_marker = if is_current {
                     Span::styled("* ", Style::default().fg(C_GREEN))
+                } else if is_marked {
+                    Span::styled("• ", Style::default().fg(C_ORANGE))
                 } else {
                     Span::raw("  ")
                 };
 
-                let idx_color = if is_current { C_ORANGE } else { C_DIM };
-                let txt_color = if is_current { C_CYAN   } else { C_HINT };
+                let idx_color = if is_current { C_ORANGE } else if is_marked { C_ORANGE } else { C_DIM };
+                let txt_color = if is_current { C_CYAN } else if is_marked { C_WHITE } else { C_HINT };
 
                 let item = ListItem::new(Line::from(vec![
                     cursor,
@@ -776,40 +704,6 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             .collect();
 
         f.render_widget(List::new(items), chunks[2]);
-
-        if app.details_mode == DetailsMode::Send {
-            let other_panes: Vec<&String> = app.pane_order.iter()
-                .filter(|n| Some(*n) != app.selected_name().as_ref())
-                .collect();
-            let picker_items: Vec<ListItem> = other_panes.iter().enumerate().map(|(i, name)| {
-                let is_sel = i == app.send_picker_sel;
-                let item = ListItem::new(Line::from(vec![
-                    Span::raw(if is_sel { ">> " } else { "   " }),
-                    Span::styled(name.to_uppercase(), Style::default()
-                        .fg(if is_sel { C_CYAN } else { C_HINT })
-                        .add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })
-                    ),
-                ]));
-                if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
-            }).collect();
-
-            let picker_height = (other_panes.len() as u16 + 2).min(chunks[2].height);
-            let picker_area = ratatui::layout::Rect {
-                x:      chunks[2].x + 2,
-                y:      chunks[2].y,
-                width:  24,
-                height: picker_height,
-            };
-            f.render_widget(ratatui::widgets::Clear, picker_area);
-            f.render_widget(
-                List::new(picker_items)
-                    .block(ratatui::widgets::Block::default()
-                        .borders(ratatui::widgets::Borders::ALL)
-                        .border_style(Style::default().fg(C_ORANGE))
-                        .title(" Send to ")),
-                picker_area,
-            );
-        }
 
         f.render_widget(divider(size.width as usize), chunks[3]);
 
@@ -827,71 +721,73 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("  [Enter] Add  [Esc] Cancel", Style::default().fg(C_DIM)),
             ]),
 
-            DetailsMode::Send => Line::from(vec![
-                Span::styled("[up/dn] Select pane", Style::default().fg(C_DIM)),
-                Span::styled(" :: ", Style::default().fg(C_ORANGE)),
-                Span::styled("[Enter] Send", Style::default().fg(C_DIM)),
-                Span::styled(" :: ", Style::default().fg(C_ORANGE)),
-                Span::styled("[Esc] Cancel", Style::default().fg(C_DIM)),
-            ]),
-
-            DetailsMode::Command => {
-                if let Some(msg) = &app.status_msg {
-                    Line::from(vec![
-                        Span::styled(msg.clone(), Style::default().fg(C_RED).add_modifier(Modifier::BOLD)),
-                    ])
-                } else {
-                    Line::from(vec![
-                        Span::styled("[CMD]",   Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD)),
-                        Span::styled(" :: ",    Style::default().fg(C_DIM)),
-                        Span::styled("[Enter]", Style::default().fg(C_DIM)),
-                        Span::styled(" Play",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[R]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Remove", Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[S]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Send",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[Tab]",   Style::default().fg(C_DIM)),
-                        Span::styled(" Normal", Style::default().fg(C_DIM)),
-                    ])
-                }
-            },
-
             DetailsMode::Normal => {
                 if let Some(msg) = &app.status_msg {
                     Line::from(vec![
                         Span::styled(msg.clone(), Style::default().fg(C_RED).add_modifier(Modifier::BOLD)),
                     ])
+                } else if app.command_mode {
+                    Line::from(vec![
+                        Span::styled("[CMD]",    Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD)),
+                        Span::styled(" :: ",     Style::default().fg(C_DIM)),
+                        Span::styled("[Space]",  Style::default().fg(C_DIM)),
+                        Span::styled(" Pause",   Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[m]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Mute",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[Enter]",  Style::default().fg(C_DIM)),
+                        Span::styled(" Next",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[h/l]",    Style::default().fg(C_DIM)),
+                        Span::styled(" ±5s",     Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[j/k]",    Style::default().fg(C_DIM)),
+                        Span::styled(" ±60s",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[9/0]",    Style::default().fg(C_DIM)),
+                        Span::styled(" Vol",     Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[Tab]",    Style::default().fg(C_DIM)),
+                        Span::styled(" Close",   Style::default().fg(C_DIM)),
+                    ])
                 } else {
                     Line::from(vec![
-                        Span::styled("[up/dn]", Style::default().fg(C_DIM)),
-                        Span::styled(" Select", Style::default().fg(C_DIM)),
+                        Span::styled("[j/k]",   Style::default().fg(C_DIM)),
+                        Span::styled(" Nav",    Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[g]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Jump",   Style::default().fg(C_DIM)),
+                        Span::styled("[Spc]",   Style::default().fg(C_DIM)),
+                        Span::styled(" Mark",   Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[J]",     Style::default().fg(C_DIM)),
-                        Span::styled(" End",    Style::default().fg(C_DIM)),
+                        Span::styled("[D]",     Style::default().fg(C_DIM)),
+                        Span::styled(" Del",    Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[n]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Add",    Style::default().fg(C_DIM)),
+                        Span::styled("[M]",     Style::default().fg(C_DIM)),
+                        Span::styled(" Move",   Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
                         Span::styled("[C]",     Style::default().fg(C_DIM)),
                         Span::styled(" Crop",   Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[Tab]",   Style::default().fg(C_DIM)),
-                        Span::styled(" Cmd",    Style::default().fg(C_DIM)),
+                        Span::styled("[A]",     Style::default().fg(C_DIM)),
+                        Span::styled(" Add",    Style::default().fg(C_DIM)),
                         Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[Esc]",   Style::default().fg(C_DIM)),
+                        Span::styled("[S]",     Style::default().fg(C_DIM)),
+                        Span::styled(" Save",   Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                        Span::styled("[G]",     Style::default().fg(C_DIM)),
+                        Span::styled(" Goto",   Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                        Span::styled("[S-Spc]", Style::default().fg(C_DIM)),
+                        Span::styled(" Play",   Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                        Span::styled("[↵]",    Style::default().fg(C_DIM)),
                         Span::styled(" Back",   Style::default().fg(C_DIM)),
                     ])
                 }
             },
         };
 
-        let footer_widget = if app.details_mode == DetailsMode::Command {
+        let footer_widget = if app.command_mode {
             Paragraph::new(footer)
                 .style(Style::default().bg(Color::Rgb(80, 40, 10)).fg(Color::Rgb(160, 100, 40)))
         } else {
@@ -965,19 +861,6 @@ async fn cmd_mute_others(ws_tx: &mut WsSink, keep: &str, pane_order: &[String]) 
     }
 }
 
-async fn cmd_swap_volume(ws_tx: &mut WsSink, pane_a: &str, pane_b: &str, panes: &HashMap<String, PaneState>) {
-    let vol_a = panes.get(pane_a).map(|p| p.volume).unwrap_or(0.0);
-    let vol_b = panes.get(pane_b).map(|p| p.volume).unwrap_or(0.0);
-    send_cmd(ws_tx, pane_a, "set_property", serde_json::json!(["volume", vol_b])).await;
-    send_cmd(ws_tx, pane_b, "set_property", serde_json::json!(["volume", vol_a])).await;
-}
-
-async fn cmd_set_volume_all(ws_tx: &mut WsSink, vol: f64, pane_order: &[String]) {
-    for pane in pane_order {
-        send_cmd(ws_tx, pane, "set_property", serde_json::json!(["volume", vol])).await;
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Spawn daemon sibling binary.
 //
@@ -986,27 +869,25 @@ async fn cmd_set_volume_all(ws_tx: &mut WsSink, vol: f64, pane_order: &[String])
 // Returns Ok(()) if spawned, Err if binary not found or spawn fails.
 // ---------------------------------------------------------------------------
 
-fn spawn_daemon() -> io::Result<()> {
-    use std::os::unix::process::CommandExt;
+fn spawn_daemon() -> bool {
+    let Ok(exe) = std::env::current_exe() else { return false; };
+    let Some(dir) = exe.parent() else { return false; };
+    let daemon_path = dir.join("panebot-daemon");
 
-    let daemon_path = std::env::current_exe()?
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "could not determine binary dir"))?
-        .join("panebot-daemon");
+    if !daemon_path.exists() { return false; }
 
-    if !daemon_path.exists() {
-        return Err(io::Error::new(io::ErrorKind::NotFound,
-            format!("{} not found", daemon_path.display())));
+    let mut cmd = std::process::Command::new(&daemon_path);
+    cmd.stdin(std::process::Stdio::null())
+       .stdout(std::process::Stdio::null())
+       .stderr(std::process::Stdio::null());
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
     }
 
-    std::process::Command::new(&daemon_path)
-        .process_group(0)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    Ok(())
+    cmd.spawn().is_ok()
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,29 +904,29 @@ fn spawn_daemon() -> io::Result<()> {
 async fn connect_ws(
     terminal: &mut Term,
     addr:     &str,
-) -> io::Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>> {
+) -> io::Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, bool)> {
 
     render_startup(terminal, &format!("Connecting to {}...", addr))?;
 
     // Fast path — daemon already running
     if let Ok((ws, _)) = connect_async(addr).await {
-        return Ok(ws);
+        return Ok((ws, false));
     }
 
     let is_local = addr == LOCAL_ADDR;
 
     if is_local {
-        // Try to spawn the daemon binary if it exists alongside us
-        match spawn_daemon() {
-            Ok(())   => render_startup(terminal, "Starting daemon...")?,
-            Err(e)   => render_startup(terminal, &format!("Waiting for daemon... ({})", e))?,
+        let spawned = spawn_daemon();
+        if spawned {
+            render_startup(terminal, "Starting daemon...")?;
+        } else {
+            render_startup(terminal, "Waiting for daemon...")?;
         }
-        // Wait indefinitely — daemon may be starting or managed externally
         loop {
             render_startup(terminal, "Waiting for daemon...")?;
             tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
             if let Ok((ws, _)) = connect_async(addr).await {
-                return Ok(ws);
+                return Ok((ws, spawned));
             }
         }
     }
@@ -1057,13 +938,21 @@ async fn connect_ws(
         render_startup(terminal, &format!("Waiting for {} ({}s)...", addr, remaining))?;
         tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
         if let Ok((ws, _)) = connect_async(addr).await {
-            return Ok(ws);
+            return Ok((ws, false));
         }
     }
 
     Err(io::Error::new(io::ErrorKind::TimedOut,
         format!("Could not connect to {} after {}s", addr, CONNECT_TIMEOUT_S)))
 }
+
+// ---------------------------------------------------------------------------
+// Host resolution
+//
+// 0 hosts configured → connect to localhost
+// 1 host configured  → connect to it automatically
+// 2+ hosts           → show picker, user selects
+// ---------------------------------------------------------------------------
 
 async fn resolve_daemon_addr(terminal: &mut Term) -> io::Result<Option<String>> {
     let hosts = load_hosts();
@@ -1169,8 +1058,7 @@ async fn handle_key(
                     if !entry.is_empty() {
                         if let Some(pane) = app.selected_name() {
                             let expanded = if entry.starts_with('~') {
-                                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-                                entry.replacen('~', &home, 1)
+                                entry.replacen('~', &app.home, 1)
                             } else {
                                 entry.clone()
                             };
@@ -1197,127 +1085,66 @@ async fn handle_key(
             return Ok(KeyAction::RenderDetails);
         }
 
-        // -- Send picker mode --
-        if app.details_mode == DetailsMode::Send {
-            let other_panes: Vec<String> = app.pane_order.iter()
-                .filter(|n| Some(*n) != app.selected_name().as_ref())
-                .cloned()
-                .collect();
-            match k.code {
-                KeyCode::Char('k') | KeyCode::Up => {
-                    app.send_picker_sel = app.send_picker_sel.saturating_sub(1);
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if app.send_picker_sel + 1 < other_panes.len() {
-                        app.send_picker_sel += 1;
+        // -- Command mode (global, works in details too) --
+        if app.command_mode {
+            if let Some(pane) = app.selected_name() {
+                match k.code {
+                    KeyCode::Char(' ')              => { send_cmd(ws_tx, &pane, "cycle",     serde_json::json!(["pause"])).await; }
+                    KeyCode::Char('m')              => { send_cmd(ws_tx, &pane, "cycle",     serde_json::json!(["mute"])).await; }
+                    KeyCode::Enter                  => { send_cmd(ws_tx, &pane, "keypress",  serde_json::json!(["ENTER"])).await; }
+                    KeyCode::Char('f')              => { send_cmd(ws_tx, &pane, "cycle",     serde_json::json!(["fullscreen"])).await; }
+                    KeyCode::Left  | KeyCode::Char('h') => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-5,  "relative"])).await; }
+                    KeyCode::Right | KeyCode::Char('l') => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([5,   "relative"])).await; }
+                    KeyCode::Up    | KeyCode::Char('k') => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([60,  "relative"])).await; }
+                    KeyCode::Down  | KeyCode::Char('j') => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-60, "relative"])).await; }
+                    KeyCode::Char('0')              => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume",  5])).await; }
+                    KeyCode::Char('9')              => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume", -5])).await; }
+                    KeyCode::Char('v')              => { /* TODO: advanced passthrough */ }
+                    KeyCode::Tab                    => {
+                        app.command_mode = false;
+                        app.status_msg   = None;
                     }
+                    _ => return Ok(KeyAction::Nothing),
                 }
-                KeyCode::Enter => {
-                    if let Some(target) = other_panes.get(app.send_picker_sel) {
-                        let target = target.clone();
-                        if let Some(src_pane) = app.selected_name() {
-                            let idx         = app.playlist_sel;
-                            let current_pos = app.current_playlist_pos();
-                            if current_pos >= 0 && current_pos as usize == idx {
-                                app.status_msg   = Some("Cannot move playing item".to_string());
-                                app.details_mode = DetailsMode::Normal;
-                                return Ok(KeyAction::RenderDetails);
-                            }
-                            if let Some(entry) = app.playlist_items.get(idx).cloned() {
-                                let _ = m3u_append(&target, &entry);
-                                reload_playlist_cmd(ws_tx, &target).await;
-                                match m3u_remove(&src_pane, idx, current_pos) {
-                                    Ok(Some(items)) => {
-                                        app.playlist_items = items;
-                                        if app.playlist_sel > 0 && app.playlist_sel >= app.playlist_items.len() {
-                                            app.playlist_sel -= 1;
-                                        }
-                                        reload_playlist_cmd(ws_tx, &src_pane).await;
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                    app.details_mode    = DetailsMode::Normal;
-                    app.send_picker_sel = 0;
-                }
-                KeyCode::Esc => {
-                    app.details_mode    = DetailsMode::Normal;
-                    app.send_picker_sel = 0;
-                }
-                _ => return Ok(KeyAction::Nothing),
+                return Ok(KeyAction::RenderDetails);
             }
-            return Ok(KeyAction::RenderDetails);
-        }
-
-        // -- Command mode --
-        if app.details_mode == DetailsMode::Command {
-            match k.code {
-                KeyCode::Tab | KeyCode::Esc => {
-                    app.details_mode = DetailsMode::Normal;
-                    app.status_msg   = None;
-                }
-                KeyCode::Enter => {
-                    if let Some(pane) = app.selected_name() {
-                        let ps = app.panes.get(&pane);
-                        if ps.map(|p| p.idle_active).unwrap_or(true) {
-                            reload_playlist_cmd(ws_tx, &pane).await;
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        }
-                        send_cmd(ws_tx, &pane, "playlist-play-index",
-                            serde_json::json!([app.playlist_sel])).await;
-                        send_cmd(ws_tx, &pane, "set_property",
-                            serde_json::json!(["pause", false])).await;
-                    }
-                    app.status_msg = None;
-                }
-                KeyCode::Char('R') => {
-                    if app.sel_is_playing() {
-                        app.status_msg = Some("Cannot remove playing item".to_string());
-                    } else if let Some(pane) = app.selected_name() {
-                        let current_pos = app.current_playlist_pos();
-                        match m3u_remove(&pane, app.playlist_sel, current_pos) {
-                            Ok(Some(items)) => {
-                                app.playlist_items = items;
-                                if app.playlist_sel > 0 && app.playlist_sel >= app.playlist_items.len() {
-                                    app.playlist_sel -= 1;
-                                }
-                                reload_playlist_cmd(ws_tx, &pane).await;
-                                app.status_msg = None;
-                            }
-                            Ok(None) => { app.status_msg = Some("Cannot remove playing item".to_string()); }
-                            Err(e)   => { app.status_msg = Some(format!("Remove failed: {}", e)); }
-                        }
-                    }
-                }
-                KeyCode::Char('S') => {
-                    if app.sel_is_playing() {
-                        app.status_msg = Some("Cannot move playing item".to_string());
-                    } else if app.pane_order.len() > 1 {
-                        app.details_mode    = DetailsMode::Send;
-                        app.send_picker_sel = 0;
-                        app.status_msg      = None;
-                    }
-                }
-                _ => return Ok(KeyAction::Nothing),
-            }
-            return Ok(KeyAction::RenderDetails);
         }
 
         // -- Normal mode (details) --
         match k.code {
-            KeyCode::Esc => {
+            // Close details
+            KeyCode::Enter if !k.modifiers.contains(KeyModifiers::SHIFT) => {
                 app.show_details = false;
                 app.details_mode = DetailsMode::Normal;
                 app.status_msg   = None;
                 app.jump_input.clear();
+                app.selected_items.clear();
                 return Ok(KeyAction::Render);
             }
+
+            // Play selected item
+            KeyCode::Char(' ') if k.modifiers.contains(KeyModifiers::SHIFT) => {
+                if let Some(pane) = app.selected_name() {
+                    let ps = app.panes.get(&pane);
+                    if ps.map(|p| p.idle_active.unwrap_or(true)).unwrap_or(true) {
+                        reload_playlist_cmd(ws_tx, &pane).await;
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    send_cmd(ws_tx, &pane, "playlist-play-index",
+                        serde_json::json!([app.playlist_sel])).await;
+                    send_cmd(ws_tx, &pane, "set_property",
+                        serde_json::json!(["pause", false])).await;
+                    app.status_msg = None;
+                }
+            }
+
+            // Toggle command mode
             KeyCode::Tab => {
-                app.details_mode = DetailsMode::Command;
+                app.command_mode = !app.command_mode;
                 app.status_msg   = None;
             }
+
+            // Navigation
             KeyCode::Up | KeyCode::Char('k') => {
                 app.playlist_sel = app.playlist_sel.saturating_sub(1);
                 app.status_msg   = None;
@@ -1328,34 +1155,187 @@ async fn handle_key(
                 }
                 app.status_msg = None;
             }
-            KeyCode::Char('J') => {
+            KeyCode::Char('[') => {
+                let page = 10usize;
+                app.playlist_sel = app.playlist_sel.saturating_sub(page);
+                app.status_msg   = None;
+            }
+            KeyCode::Char(']') => {
+                let page = 10usize;
+                let max  = app.playlist_items.len().saturating_sub(1);
+                app.playlist_sel = (app.playlist_sel + page).min(max);
+                app.status_msg   = None;
+            }
+            KeyCode::Char('\\') => {
                 app.playlist_sel = app.playlist_items.len().saturating_sub(1);
                 app.status_msg   = None;
             }
-            KeyCode::Char('g') => {
+
+            // Toggle selection on current item
+            KeyCode::Char(' ') => {
+                let idx = app.playlist_sel;
+                if app.selected_items.contains(&idx) {
+                    app.selected_items.remove(&idx);
+                } else {
+                    app.selected_items.insert(idx);
+                }
+                // Advance cursor after marking
+                if app.playlist_sel + 1 < app.playlist_items.len() {
+                    app.playlist_sel += 1;
+                }
+                app.status_msg = None;
+            }
+
+            // Clear selection
+            KeyCode::Esc => {
+                if !app.selected_items.is_empty() {
+                    app.selected_items.clear();
+                    app.status_msg = None;
+                } else {
+                    return Ok(KeyAction::Nothing);
+                }
+            }
+
+            // Go to item number
+            KeyCode::Char('G') => {
                 app.details_mode = DetailsMode::Jump;
                 app.jump_input.clear();
             }
-            KeyCode::Char('n') => {
+
+            // Add item
+            KeyCode::Char('A') => {
                 app.details_mode = DetailsMode::Add;
                 app.add_input.clear();
                 app.status_msg   = None;
             }
-            KeyCode::Char('C') => {
+
+            // Delete — multi-aware
+            KeyCode::Char('D') => {
                 if let Some(pane) = app.selected_name() {
                     let current_pos = app.current_playlist_pos();
-                    match m3u_crop(&pane, current_pos) {
-                        Ok(Some(items)) => {
-                            app.playlist_items = items;
-                            app.playlist_sel   = 0;
-                            reload_playlist_cmd(ws_tx, &pane).await;
-                            app.status_msg = None;
+                    let targets: Vec<usize> = if app.selected_items.is_empty() {
+                        vec![app.playlist_sel]
+                    } else {
+                        let mut v: Vec<usize> = app.selected_items.iter().cloned().collect();
+                        v.sort_unstable();
+                        v
+                    };
+
+                    // Check none of the targets are currently playing
+                    if targets.iter().any(|&i| current_pos >= 0 && i as i64 == current_pos) {
+                        app.status_msg = Some("Cannot remove playing item".to_string());
+                    } else {
+                        let mut items = app.playlist_items.clone();
+                        // Remove in reverse order to preserve indices
+                        for &idx in targets.iter().rev() {
+                            if idx < items.len() { items.remove(idx); }
                         }
-                        Ok(None) => { app.status_msg = Some("Nothing playing to crop around".to_string()); }
-                        Err(e)   => { app.status_msg = Some(format!("Crop failed: {}", e)); }
+                        match write_m3u(&pane, &items) {
+                            Ok(_) => {
+                                app.playlist_items = items;
+                                app.selected_items.clear();
+                                app.playlist_sel = app.playlist_sel.min(
+                                    app.playlist_items.len().saturating_sub(1)
+                                );
+                                reload_playlist_cmd(ws_tx, &pane).await;
+                                app.status_msg = None;
+                            }
+                            Err(e) => { app.status_msg = Some(format!("Delete failed: {}", e)); }
+                        }
                     }
                 }
             }
+
+            // Move selected items to cursor position — multi-aware
+            KeyCode::Char('M') => {
+                if let Some(pane) = app.selected_name() {
+                    if app.selected_items.is_empty() {
+                        app.status_msg = Some("Mark items with Space first".to_string());
+                    } else {
+                        let dest = app.playlist_sel;
+                        let mut targets: Vec<usize> = app.selected_items.iter().cloned().collect();
+                        targets.sort_unstable();
+
+                        // Build new list: extract marked items, insert at dest
+                        let marked: Vec<String> = targets.iter()
+                            .filter_map(|&i| app.playlist_items.get(i).cloned())
+                            .collect();
+                        let mut rest: Vec<String> = app.playlist_items.iter().enumerate()
+                            .filter(|(i, _)| !app.selected_items.contains(i))
+                            .map(|(_, s)| s.clone())
+                            .collect();
+
+                        // Adjust dest for removed items before it
+                        let removed_before = targets.iter().filter(|&&i| i < dest).count();
+                        let insert_at = dest.saturating_sub(removed_before).min(rest.len());
+                        for (j, item) in marked.into_iter().enumerate() {
+                            rest.insert(insert_at + j, item);
+                        }
+
+                        match write_m3u(&pane, &rest) {
+                            Ok(_) => {
+                                app.playlist_items = rest;
+                                app.selected_items.clear();
+                                app.playlist_sel = insert_at;
+                                reload_playlist_cmd(ws_tx, &pane).await;
+                                app.status_msg = None;
+                            }
+                            Err(e) => { app.status_msg = Some(format!("Move failed: {}", e)); }
+                        }
+                    }
+                }
+            }
+
+            // Crop — multi-aware: if items selected keep those, else keep playing item
+            KeyCode::Char('C') => {
+                if let Some(pane) = app.selected_name() {
+                    if app.selected_items.is_empty() {
+                        let current_pos = app.current_playlist_pos();
+                        match m3u_crop(&pane, current_pos) {
+                            Ok(Some(items)) => {
+                                app.playlist_items = items;
+                                app.playlist_sel   = 0;
+                                reload_playlist_cmd(ws_tx, &pane).await;
+                                app.status_msg = None;
+                            }
+                            Ok(None) => { app.status_msg = Some("Nothing playing to crop around".to_string()); }
+                            Err(e)   => { app.status_msg = Some(format!("Crop failed: {}", e)); }
+                        }
+                    } else {
+                        let mut targets: Vec<usize> = app.selected_items.iter().cloned().collect();
+                        targets.sort_unstable();
+                        let kept: Vec<String> = targets.iter()
+                            .filter_map(|&i| app.playlist_items.get(i).cloned())
+                            .collect();
+                        match write_m3u(&pane, &kept) {
+                            Ok(_) => {
+                                app.playlist_items = kept;
+                                app.selected_items.clear();
+                                app.playlist_sel = 0;
+                                reload_playlist_cmd(ws_tx, &pane).await;
+                                app.status_msg = None;
+                            }
+                            Err(e) => { app.status_msg = Some(format!("Crop failed: {}", e)); }
+                        }
+                    }
+                }
+            }
+
+            // Save playlist
+            KeyCode::Char('S') => {
+                if let Some(pane) = app.selected_name() {
+                    match save_playlist(&pane) {
+                        Ok(n) => {
+                            app.playlist_items = read_m3u(&pane);
+                            app.status_msg = Some(format!("Saved {} items", n));
+                        }
+                        Err(e) => {
+                            app.status_msg = Some(format!("Save failed: {}", e));
+                        }
+                    }
+                }
+            }
+
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::RenderDetails);
@@ -1401,8 +1381,9 @@ async fn handle_key(
         if let Some(pane) = app.selected_name() {
             app.playlist_items = read_m3u(&pane);
             app.playlist_sel   = app.panes.get(&pane)
-                .map(|p| p.playlist_pos.max(0) as usize)
+                .map(|p| p.playlist_pos.unwrap_or(0).max(0) as usize)
                 .unwrap_or(0);
+            app.selected_items.clear();
             app.show_details   = true;
             app.details_mode   = DetailsMode::Normal;
             app.status_msg     = None;
@@ -1427,6 +1408,41 @@ async fn handle_key(
         match k.code {
             KeyCode::Char('j') | KeyCode::Down => { app.select_next(); return Ok(KeyAction::Render); }
             KeyCode::Char('k') | KeyCode::Up   => { app.select_prev(); return Ok(KeyAction::Render); }
+            // Orchestration
+            KeyCode::Char('r') => {
+                if let Some(pane) = app.selected_name() {
+                    send_node_cmd(ws_tx, "panebot:restart-pane", serde_json::json!({"pane": pane})).await;
+                }
+                return Ok(KeyAction::Render);
+            }
+            KeyCode::Char('R') => {
+                send_node_cmd(ws_tx, "panebot:restart-all", serde_json::json!({})).await;
+                return Ok(KeyAction::Render);
+            }
+            KeyCode::Char('S') => {
+                if let Some(pane) = app.selected_name() {
+                    let pane_order = app.pane_order.clone();
+                    cmd_solo(ws_tx, &pane, &pane_order).await;
+                }
+                return Ok(KeyAction::Render);
+            }
+            KeyCode::Char('M') => {
+                if let Some(pane) = app.selected_name() {
+                    let pane_order = app.pane_order.clone();
+                    cmd_mute_others(ws_tx, &pane, &pane_order).await;
+                }
+                return Ok(KeyAction::Render);
+            }
+            KeyCode::Char('X') => {
+                let pane_order = app.pane_order.clone();
+                cmd_stop_all(ws_tx, &pane_order).await;
+                return Ok(KeyAction::Render);
+            }
+            KeyCode::Char('P') => {
+                let pane_order = app.pane_order.clone();
+                cmd_start_all(ws_tx, &pane_order).await;
+                return Ok(KeyAction::Render);
+            }
             _ => {}
         }
     }
@@ -1434,18 +1450,17 @@ async fn handle_key(
     if app.command_mode {
         if let Some(pane) = app.selected_name() {
             match k.code {
-                KeyCode::Char(' ') => { send_cmd(ws_tx, &pane, "cycle",          serde_json::json!(["pause"])).await; }
-                KeyCode::Char('m') => { send_cmd(ws_tx, &pane, "cycle",          serde_json::json!(["mute"])).await; }
-                KeyCode::Char('j') | KeyCode::Down  => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-10, "relative"])).await; }
-                KeyCode::Char('k') | KeyCode::Up    => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([10,  "relative"])).await; }
-                KeyCode::Char('h') | KeyCode::Left  => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-60, "relative"])).await; }
-                KeyCode::Char('l') | KeyCode::Right => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([60,  "relative"])).await; }
-                KeyCode::Char('=') => { send_cmd(ws_tx, &pane, "add",            serde_json::json!(["volume",  5])).await; }
-                KeyCode::Char('-') => { send_cmd(ws_tx, &pane, "add",            serde_json::json!(["volume", -5.0])).await; }
-                KeyCode::Char('n') => { send_cmd(ws_tx, &pane, "playlist-next",  serde_json::json!([])).await; }
-                KeyCode::Char('N') => { send_cmd(ws_tx, &pane, "playlist-prev",  serde_json::json!([])).await; }
-                KeyCode::Char('f') => { send_cmd(ws_tx, &pane, "cycle",          serde_json::json!(["fullscreen"])).await; }
-                KeyCode::Char('R') => { send_node_cmd(ws_tx, "panebot:restart-pane", serde_json::json!({"pane": pane})).await; }
+                KeyCode::Char(' ')              => { send_cmd(ws_tx, &pane, "cycle",         serde_json::json!(["pause"])).await; }
+                KeyCode::Char('m')              => { send_cmd(ws_tx, &pane, "cycle",         serde_json::json!(["mute"])).await; }
+                KeyCode::Enter                  => { send_cmd(ws_tx, &pane, "keypress",      serde_json::json!(["ENTER"])).await; }
+                KeyCode::Char('f')              => { send_cmd(ws_tx, &pane, "cycle",         serde_json::json!(["fullscreen"])).await; }
+                KeyCode::Left  | KeyCode::Char('h') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([-5,  "relative"])).await; }
+                KeyCode::Right | KeyCode::Char('l') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([5,   "relative"])).await; }
+                KeyCode::Up    | KeyCode::Char('k') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([60,  "relative"])).await; }
+                KeyCode::Down  | KeyCode::Char('j') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([-60, "relative"])).await; }
+                KeyCode::Char('0')              => { send_cmd(ws_tx, &pane, "add",          serde_json::json!(["volume",  5])).await; }
+                KeyCode::Char('9')              => { send_cmd(ws_tx, &pane, "add",          serde_json::json!(["volume", -5])).await; }
+                KeyCode::Char('v')              => { /* TODO: advanced passthrough mode */ }
                 _ => return Ok(KeyAction::Nothing),
             }
             return Ok(KeyAction::Render);
@@ -1470,16 +1485,20 @@ async fn run(terminal: &mut Term, addr: &str) -> io::Result<()> {
     'reconnect: loop {
 
         let ws = match connect_ws(terminal, addr).await {
-            Ok(ws) => ws,
-            Err(e) => {
-                render_startup(terminal, &format!("{}", e))?;
+            Ok((ws, spawned)) => {
+                if spawned { app.owns_daemon = true; }
+                ws
+            }
+            Err(_) => {
                 tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                return Ok(());
+                continue 'reconnect;
             }
         };
 
-        // Reset online state — fresh events will arrive from daemon
-        for ps in app.panes.values_mut() { ps.online = false; }
+        // Clear pane state on reconnect — node:snapshot will repopulate fresh.
+        app.pane_order.clear();
+        app.panes.clear();
+        app.selected = 0;
 
         let (mut ws_tx, mut ws_rx) = ws.split();
 
@@ -1493,15 +1512,11 @@ async fn run(terminal: &mut Term, addr: &str) -> io::Result<()> {
                             if app.show_details { render_details(terminal, &app)?; }
                             else                { render(terminal, &app)?;         }
                             if signal == Some("node:down") {
-                                log_node(&mut app, vec![("reconnecting...".to_string(), C_HINT)]);
-                                render(terminal, &app)?;
                                 tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                                 continue 'reconnect;
                             }
                         }
                         Some(Err(_)) | None => {
-                            log_node(&mut app, vec![("connection lost — reconnecting...".to_string(), C_RED)]);
-                            render(terminal, &app)?;
                             tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                             continue 'reconnect;
                         }
@@ -1513,7 +1528,14 @@ async fn run(terminal: &mut Term, addr: &str) -> io::Result<()> {
                     match key {
                         Some(Ok(Event::Key(k))) => {
                             match handle_key(&mut app, k, &mut ws_tx).await? {
-                                KeyAction::Quit          => break 'reconnect,
+                                KeyAction::Quit => {
+                                    if app.owns_daemon {
+                                        send_node_cmd(&mut ws_tx, "panebot:shutdown",
+                                            serde_json::json!({})).await;
+                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                    }
+                                    break 'reconnect;
+                                }
                                 KeyAction::Render        => render(terminal, &app)?,
                                 KeyAction::RenderDetails => {
                                     if app.show_details { render_details(terminal, &app)?; }

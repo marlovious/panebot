@@ -322,8 +322,6 @@ pub fn save_playlist(mpv_name: &str) -> io::Result<usize> {
     write_m3u(mpv_name, &items)?;
     Ok(items.len())
 }
-
-// Crop: keep only the currently-playing item.
 // Returns Ok(None) if nothing is playing.
 pub fn m3u_crop(mpv_name: &str, current_pos: i64) -> io::Result<Option<Vec<String>>> {
     if current_pos < 0 {
