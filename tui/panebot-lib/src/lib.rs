@@ -41,15 +41,12 @@ pub fn pane_playlist(mpv_name: &str) -> PathBuf { pane_dir(mpv_name).join(format
 //
 // Pane.geometry removed — geometry is now owned entirely by layout files.
 // Geometry is never stored in panes.conf or on the Pane struct.
-// PaneType removed — pane_type is a display label only, shown in TUI,
-// does not affect mpv behavior.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 pub struct Pane {
     pub mpv_name:  String,          // instance name — drives all paths, never changes
     pub pane_name: String,          // display name — TUI and mpv window title, change freely
-    pub pane_type: String,          // display label only
     pub playlist:  Option<String>,  // external playlist path — passed to mpv at launch
 }
 
@@ -151,7 +148,6 @@ pub fn load_config() -> Config {
     let mut panes     = Vec::new();
     let mut name:      Option<String> = None;
     let mut pane_name: Option<String> = None;
-    let mut ptype     = "video".to_string();
     let mut playlist:  Option<String> = None;
 
     macro_rules! flush {
@@ -160,7 +156,6 @@ pub fn load_config() -> Config {
                 panes.push(Pane {
                     mpv_name:  n.clone(),
                     pane_name: pane_name.clone().unwrap_or_else(|| n.clone()),
-                    pane_type: ptype.clone(),
                     playlist:  playlist.clone(),
                 });
             }
@@ -175,7 +170,6 @@ pub fn load_config() -> Config {
             flush!();
             name      = Some(line[1..line.len()-1].to_string());
             pane_name = None;
-            ptype     = "video".to_string();
             playlist  = None;
             continue;
         }
@@ -185,7 +179,6 @@ pub fn load_config() -> Config {
             let val = line[eq+1..].trim().to_string();
             match key {
                 "layout"    => layout    = val,
-                "type"      => ptype     = val,
                 "pane_name" => pane_name = Some(val),
                 "playlist"  => playlist  = Some(expand_tilde(&val, &home)),
                 _           => {}

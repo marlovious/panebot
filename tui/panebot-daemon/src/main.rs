@@ -11,7 +11,7 @@ use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
 
 use panebot_lib::{
-    load_config,
+    load_config, load_hosts,
     config_dir, layouts_dir, panes_conf, hosts_conf,
     pane_dir, pane_mpv_conf, pane_playlist, pane_scripts, pane_socket,
     Pane,
@@ -23,7 +23,7 @@ use panebot_lib::{
 
 const MONITOR_RETRY_MS:     u64 = 500;   // delay between mpv socket connect attempts
 const RESTART_PANE_WAIT_MS: u64 = 3000;  // wait after kill before relaunch
-const RESTART_ALL_WAIT_MS:  u64 = 300;   // wait after killing all before relaunch
+const RESTART_ALL_WAIT_MS:  u64 = 1000;  // wait after killing all before relaunch
 
 // ---------------------------------------------------------------------------
 // Default file contents
@@ -33,27 +33,23 @@ const DEFAULT_PANES_CONF: &str = "\
 # pb.panes.conf
 # [instance_name]                   — drives directory, socket, mpv.conf. set once, never change.
 # pane_name = My Pane               — display name in TUI and mpv window title. change freely.
-# type      = video                 — label only, shown in TUI, does not affect mpv.
-# playlist  = /path/to/file.m3u    — optional. point mpv at an external playlist or directory.
-#                                     if omitted, panebot uses the pane's own .m3u file.
+# playlist  = /path/to/file.m3u    — optional. point mpv at an external playlist, directory,
+#                                     or stream URL. if omitted, panebot uses the pane's own
+#                                     .m3u file in ~/.config/panebot/{instance_name}/.
 
 layout = pb.left.stack
 
 [music]
-type     = video
-playlist = ~/premiumize/0video.stash/video.films/toons/
+pane_name = Music
 
 [wide-top]
-type     = video
-playlist = ~/premiumize/0video.stash/video.films/
+pane_name = Wide Top
 
 [wide-bottom]
-type     = video
-playlist = ~/premiumize/0video.stash/video.films/
+pane_name = Wide Bottom
 
 [standard]
-type     = video
-playlist = ~/premiumize/0video.stash/video.series/
+pane_name = Standard
 ";
 
 const DEFAULT_HOSTS_CONF: &str = "\
@@ -128,12 +124,16 @@ impl Logger {
 
     fn log(&mut self, msg: &str) {
         use std::time::{SystemTime, UNIX_EPOCH};
-        let ts   = SystemTime::now()
+        let secs  = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let line = format!("[{}] {}\n", ts, msg);
-        let _    = self.file.write_all(line.as_bytes());
+        let h     = (secs % 86400) / 3600;
+        let m     = (secs % 3600) / 60;
+        let s     = secs % 60;
+        let host: String = hostname().chars().take(10).collect();
+        let line  = format!("[{:02}:{:02}:{:02}] [{}] {}\n", h, m, s, host, msg);
+        let _     = self.file.write_all(line.as_bytes());
         print!("{}", line);
     }
 }
@@ -176,10 +176,11 @@ fn bootstrap(log: &mut Logger) -> std::io::Result<panebot_lib::Config> {
         let mpv_conf = pane_mpv_conf(&pane.mpv_name);
         if !mpv_conf.exists() {
             let mut f = std::fs::File::create(&mpv_conf)?;
-            writeln!(f, "# panebot mpv config — {} [{}]", pane.mpv_name, pane.pane_type)?;
+            writeln!(f, "# panebot mpv config — {}", pane.mpv_name)?;
             writeln!(f, "# Edit this file to tune mpv for this pane.")?;
             writeln!(f, "# Required options — panebot depends on these.")?;
             writeln!(f, "force-window=yes")?;
+            writeln!(f, "idle=yes")?;
             writeln!(f, "really-quiet=yes")?;
             writeln!(f, "pause=yes")?;
             writeln!(f, "volume=100")?;
@@ -348,7 +349,6 @@ async fn kill_pane_async(mpv_name: &str, log: &mut Logger) {
 pub struct PaneState {
     pub mpv_name:     String,
     pub pane_name:    String,
-    pub pane_type:    String,
     pub online:       bool,
     pub idle_active:  Option<bool>,
     pub paused:       Option<bool>,
@@ -359,11 +359,10 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    fn new(mpv_name: &str, pane_name: &str, pane_type: &str) -> Self {
+    fn new(mpv_name: &str, pane_name: &str) -> Self {
         PaneState {
             mpv_name:     mpv_name.to_string(),
             pane_name:    pane_name.to_string(),
-            pane_type:    pane_type.to_string(),
             online:       false,
             idle_active:  None,
             paused:       None,
@@ -401,7 +400,7 @@ async fn monitor_pane(
                 {
                     let mut s = state.lock().unwrap();
                     let ps = s.entry(pane.mpv_name.clone())
-                        .or_insert_with(|| PaneState::new(&pane.mpv_name, &pane.pane_name, &pane.pane_type));
+                        .or_insert_with(|| PaneState::new(&pane.mpv_name, &pane.pane_name));
                     if ps.online {
                         ps.online = false;
                         let _ = tx.send(serde_json::json!({
@@ -448,17 +447,17 @@ async fn monitor_pane(
         {
             let mut s = state.lock().unwrap();
             let ps = s.entry(pane.mpv_name.clone())
-                .or_insert_with(|| PaneState::new(&pane.mpv_name, &pane.pane_name, &pane.pane_type));
+                .or_insert_with(|| PaneState::new(&pane.mpv_name, &pane.pane_name));
             ps.online = true;
             let _ = tx.send(serde_json::json!({
                 "pane":  pane.mpv_name,
-                "event": "online"
+                "event": "online",
+                "state": &*ps,
             }).to_string());
         }
 
         let mpv_name          = pane.mpv_name.clone();
         let pane_display_name = pane.pane_name.clone();
-        let pane_type         = pane.pane_type.clone();
         let state_r           = state.clone();
         let tx_r              = tx.clone();
 
@@ -480,7 +479,7 @@ async fn monitor_pane(
                     let prop  = v["name"].as_str().unwrap_or("").to_string();
                     let mut s = state_r.lock().unwrap();
                     let ps    = s.entry(mpv_name.clone())
-                        .or_insert_with(|| PaneState::new(&mpv_name, &pane_display_name, &pane_type));
+                        .or_insert_with(|| PaneState::new(&mpv_name, &pane_display_name));
 
                     match prop.as_str() {
                         "pause"        => { ps.paused       = v["data"].as_bool(); }
@@ -679,7 +678,7 @@ async fn handle_node_command(
 ) {
     match cmd {
 
-        "panebot:node-info" | "panebot:node-status" => {
+        "panebot:node-info" => {
             let s     = state.lock().unwrap();
             let ps: Vec<&PaneState> = s.values().collect();
             let _ = tx.send(serde_json::json!({
@@ -763,14 +762,6 @@ async fn handle_node_command(
                     "layout": layout_name,
                 }).to_string());
             }
-        }
-
-        "panebot:reload-config" => {
-            let _ = tx.send(serde_json::json!({
-                "event":  "node:reload-config",
-                "status": "not-yet-implemented",
-                "reason": "requires mutable shared pane list"
-            }).to_string());
         }
 
         "panebot:shutdown" => {
@@ -858,6 +849,20 @@ async fn main() {
     // Load layout first so geometry is available at launch time
     let layout_map = load_layout(&cfg.layout, &mut log);
 
+    // Clean stale sockets before launch — if mpv crashed without removing its
+    // socket, UnixStream::connect() succeeds against the dead file and we'd
+    // think the pane is already running when it isn't.
+    for pane in &cfg.panes {
+        let socket_path = pane_socket(&pane.mpv_name);
+        if socket_path.exists() {
+            let alive = UnixStream::connect(&socket_path).await.is_ok();
+            if !alive {
+                let _ = std::fs::remove_file(&socket_path);
+                log.log(&format!("bootstrap :: {} :: stale socket removed", pane.mpv_name));
+            }
+        }
+    }
+
     // Launch only panes that are not already running
     for pane in &cfg.panes {
         let socket_path = pane_socket(&pane.mpv_name);
@@ -872,6 +877,8 @@ async fn main() {
         }
     }
 
+    let known_hosts = load_hosts();
+
     let node_snapshot = serde_json::json!({
         "event":    "node:snapshot",
         "hostname": hostname(),
@@ -881,7 +888,10 @@ async fn main() {
         "panes":    cfg.panes.iter().map(|p| serde_json::json!({
             "name":      p.mpv_name,
             "pane_name": p.pane_name,
-            "pane_type": p.pane_type,
+        })).collect::<Vec<_>>(),
+        "known_hosts": known_hosts.iter().map(|h| serde_json::json!({
+            "label":   h.label,
+            "address": h.address,
         })).collect::<Vec<_>>(),
     }).to_string();
 

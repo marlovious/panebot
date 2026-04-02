@@ -63,7 +63,6 @@ type WsSink = futures_util::stream::SplitSink<
 struct PaneState {
     mpv_name:     String,          // instance name — internal, drives paths
     pane_name:    String,          // display name — TUI and window title
-    pane_type:    String,
     online:       bool,
     idle_active:  Option<bool>,
     paused:       Option<bool>,
@@ -74,11 +73,10 @@ struct PaneState {
 }
 
 impl PaneState {
-    fn new(mpv_name: &str, pane_name: &str, pane_type: &str) -> Self {
+    fn new(mpv_name: &str, pane_name: &str) -> Self {
         PaneState {
             mpv_name:     mpv_name.to_string(),
             pane_name:    pane_name.to_string(),
-            pane_type:    pane_type.to_string(),
             online:       false,
             idle_active:  None,
             paused:       None,
@@ -115,6 +113,7 @@ enum DetailsMode {
     Normal,
     Jump,
     Add,
+    Confirm,  // waiting for Enter=Play or n=Queue
 }
 
 // ---------------------------------------------------------------------------
@@ -129,20 +128,22 @@ struct App {
     platform:       String,
     layout:         String,
     home:           String,
-    owns_daemon:    bool,
-    show_log:       bool,
-    command_mode:   bool,
-    show_picker:    bool,
-    picker_sel:     usize,
-    layouts:        Vec<String>,
-    show_details:   bool,
-    details_mode:   DetailsMode,
-    playlist_sel:   usize,
-    playlist_items: Vec<String>,
-    selected_items: HashSet<usize>,
-    status_msg:     Option<String>,
-    jump_input:     String,
-    add_input:      String,
+    owns_daemon:      bool,
+    is_remote:        bool,   // true when connected to a remote node — gates local-only features
+    show_log:         bool,
+    command_mode:     bool,
+    show_picker:      bool,
+    picker_sel:       usize,
+    layouts:          Vec<String>,
+    show_details:     bool,
+    details_mode:     DetailsMode,
+    playlist_sel:     usize,
+    playlist_items:   Vec<String>,
+    selected_items:   HashSet<usize>,
+    status_msg:       Option<String>,
+    jump_input:       String,
+    add_input:        String,
+    passthrough_mode: bool,   // v to enter/exit — all keys forward to mpv as keypress
 }
 
 impl App {
@@ -155,20 +156,22 @@ impl App {
             platform:       String::new(),
             layout:         String::new(),
             home:           home_dir(),
-            owns_daemon:    false,
-            show_log:       false,
-            command_mode:   false,
-            show_picker:    false,
-            picker_sel:     0,
-            layouts:        Vec::new(),
-            show_details:   false,
-            details_mode:   DetailsMode::Normal,
-            playlist_sel:   0,
-            playlist_items: Vec::new(),
-            selected_items: HashSet::new(),
-            status_msg:     None,
-            jump_input:     String::new(),
-            add_input:      String::new(),
+            owns_daemon:      false,
+            is_remote:        false,
+            show_log:         false,
+            command_mode:     false,
+            show_picker:      false,
+            picker_sel:       0,
+            layouts:          Vec::new(),
+            show_details:     false,
+            details_mode:     DetailsMode::Normal,
+            playlist_sel:     0,
+            playlist_items:   Vec::new(),
+            selected_items:   HashSet::new(),
+            status_msg:       None,
+            jump_input:       String::new(),
+            add_input:        String::new(),
+            passthrough_mode: false,
         }
     }
 
@@ -197,11 +200,6 @@ impl App {
             .and_then(|n| self.panes.get(&n))
             .and_then(|p| p.playlist_pos)
             .unwrap_or(-1)
-    }
-
-    fn sel_is_playing(&self) -> bool {
-        let pos = self.current_playlist_pos();
-        pos >= 0 && pos as usize == self.playlist_sel
     }
 
     fn load_layouts(&mut self) {
@@ -248,10 +246,9 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
                 for p in panes {
                     let mpv_name  = p["name"].as_str().unwrap_or("").to_string();
                     let pane_name = p["pane_name"].as_str().unwrap_or(mpv_name.as_str()).to_string();
-                    let ptype     = p["pane_type"].as_str().unwrap_or("video").to_string();
                     if !mpv_name.is_empty() {
                         app.pane_order.push(mpv_name.clone());
-                        app.panes.insert(mpv_name.clone(), PaneState::new(&mpv_name, &pane_name, &ptype));
+                        app.panes.insert(mpv_name.clone(), PaneState::new(&mpv_name, &pane_name));
                     }
                 }
             }
@@ -421,12 +418,30 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 .collect::<Vec<_>>()
                 .into_iter()
                 .rev()
-                .map(|line| ListItem::new(Span::styled(line, Style::default().fg(C_DIM))))
+                .map(|line| {
+                    // Format: [HH:MM:SS] [hostname] message
+                    // Highlight hostname segment, dim the rest
+                    if let Some(rest) = line.strip_prefix('[') {
+                        if let Some(mid) = rest.find("] [") {
+                            let ts   = &rest[..mid];         // HH:MM:SS
+                            let tail = &rest[mid + 3..];     // hostname] message
+                            if let Some(end) = tail.find(']') {
+                                let host = &tail[..end];
+                                let msg  = &tail[end + 1..];
+                                return ListItem::new(Line::from(vec![
+                                    Span::styled(format!("[{}] ", ts),   Style::default().fg(C_DIM)),
+                                    Span::styled(format!("[{}]", host),  Style::default().fg(C_HINT)),
+                                    Span::styled(msg.to_string(),        Style::default().fg(C_DIM)),
+                                ]));
+                            }
+                        }
+                    }
+                    ListItem::new(Span::styled(line, Style::default().fg(C_DIM)))
+                })
                 .collect();
             f.render_widget(List::new(log_lines), chunks[2]);
         } else {
             let max_name = app.panes.values().map(|p| p.pane_name.len() + 2).max().unwrap_or(8);
-            let max_type = app.panes.values().map(|p| p.pane_type.len()).max().unwrap_or(5);
 
             let items: Vec<ListItem> = app.pane_order.iter().enumerate().map(|(i, name)| {
                 let ps     = app.panes.get(name);
@@ -442,11 +457,6 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 let name_span = Span::styled(
                     format!("{:<width$}", format!("\"{}\"", ps.map(|p| p.pane_name.to_uppercase()).unwrap_or_else(|| name.to_uppercase())), width = max_name),
                     Style::default().fg(C_WHITE).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
-                );
-
-                let type_span = Span::styled(
-                    format!("[{:<width$}]", ps.map(|p| p.pane_type.to_uppercase()).unwrap_or_else(|| "?".to_string()), width = max_type),
-                    Style::default().fg(C_DIM),
                 );
 
                 let (pb_label, pb_color) = ps.map(|p| p.playback_label()).unwrap_or(("Offline", C_RED));
@@ -466,7 +476,6 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
 
                 let item = ListItem::new(Line::from(vec![
                     cursor, name_span, sep.clone(),
-                    type_span, sep.clone(),
                     pb_span, sep.clone(),
                     vol_span, sep,
                     title_span, cmd_badge,
@@ -525,7 +534,7 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("[m]",      Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(" Mute",    Style::default()),
                 Span::styled(" :: ",     Style::default()),
-                Span::styled("[↵]",     Style::default().add_modifier(Modifier::BOLD)),
+                Span::styled("[Enter]",  Style::default().add_modifier(Modifier::BOLD)),
                 Span::styled(" Next",    Style::default()),
                 Span::styled(" :: ",     Style::default()),
                 Span::styled("[h/l]",    Style::default().add_modifier(Modifier::BOLD)),
@@ -551,7 +560,7 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("[j/k]",   Style::default().fg(C_DIM)),
                 Span::styled(" Nav",    Style::default().fg(C_DIM)),
                 Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                Span::styled("[l/→]",  Style::default().fg(C_DIM)),
+                Span::styled("[l/Rt]",  Style::default().fg(C_DIM)),
                 Span::styled(" Detail", Style::default().fg(C_DIM)),
                 Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
                 Span::styled("[r/R]",   Style::default().fg(C_DIM)),
@@ -563,13 +572,16 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("[M]",     Style::default().fg(C_DIM)),
                 Span::styled(" Mute∅",  Style::default().fg(C_DIM)),
                 Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                Span::styled("[X/P]",   Style::default().fg(C_DIM)),
-                Span::styled(" Stp/Ply",Style::default().fg(C_DIM)),
+                Span::styled("[P]",     Style::default().fg(C_DIM)),
+                Span::styled(" Pause∅", Style::default().fg(C_DIM)),
                 Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
                 Span::styled("[W]",     Style::default().fg(C_DIM)),
                 Span::styled(" Layout", Style::default().fg(C_DIM)),
                 Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                Span::styled("[L]",     Style::default().fg(C_DIM)),
+                Span::styled("[C]",     Style::default().fg(C_DIM)),
+                Span::styled(" Connect",Style::default().fg(C_DIM)),
+                Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
+                Span::styled("[h/Lt]",  Style::default().fg(C_DIM)),
                 Span::styled(" Log",    Style::default().fg(C_DIM)),
                 Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
                 Span::styled("[q]",     Style::default().fg(C_DIM)),
@@ -642,11 +654,6 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             sep.clone(),
             Span::styled(format!("\"{}\"", ps.map(|p| p.pane_name.to_uppercase()).unwrap_or_else(|| pane_name.to_uppercase())), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
             sep.clone(),
-            Span::styled(
-                format!("[{}]", ps.map(|p| p.pane_type.to_uppercase()).unwrap_or_else(|| "?".to_string())),
-                Style::default().fg(C_DIM),
-            ),
-            sep.clone(),
             Span::styled(format!("[{:7}]", pb_label), Style::default().fg(pb_color)),
             sep.clone(),
             Span::styled(format!("[{:8}]", vol_str), Style::default().fg(vol_color)),
@@ -715,6 +722,14 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("  [Enter] Go  [Esc] Cancel", Style::default().fg(C_DIM)),
             ]),
 
+            DetailsMode::Confirm => Line::from(vec![
+                Span::styled("Play Now [Enter]", Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled("  ::  ", Style::default().fg(C_ORANGE)),
+                Span::styled("Queue Next [n]", Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled("  ::  ", Style::default().fg(C_ORANGE)),
+                Span::styled("Cancel [Esc]", Style::default().fg(C_DIM)),
+            ]),
+
             DetailsMode::Add => Line::from(vec![
                 Span::styled("Add: ", Style::default().fg(C_HINT)),
                 Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
@@ -753,38 +768,38 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                     ])
                 } else {
                     Line::from(vec![
-                        Span::styled("[j/k]",   Style::default().fg(C_DIM)),
-                        Span::styled(" Nav",    Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[Spc]",   Style::default().fg(C_DIM)),
-                        Span::styled(" Mark",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[↵]",    Style::default().fg(C_DIM)),
-                        Span::styled(" Play",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[n]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Queue",  Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[D]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Del",    Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[M]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Move",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[C]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Crop",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[A]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Add",    Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[S]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Save",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[G]",     Style::default().fg(C_DIM)),
-                        Span::styled(" Goto",   Style::default().fg(C_DIM)),
-                        Span::styled(" :: ",    Style::default().fg(C_ORANGE)),
-                        Span::styled("[h/←]",  Style::default().fg(C_DIM)),
-                        Span::styled(" Back",   Style::default().fg(C_DIM)),
+                        Span::styled("[j/k]",    Style::default().fg(C_DIM)),
+                        Span::styled(" Nav",     Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[Spc]",    Style::default().fg(C_DIM)),
+                        Span::styled(" Mark",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[Enter]",  Style::default().fg(C_DIM)),
+                        Span::styled(" Play",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[n]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Queue",   Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[D]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Del",     Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[M]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Move",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[C]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Crop",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[A]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Add",     Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[S]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Save",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[G]",      Style::default().fg(C_DIM)),
+                        Span::styled(" Goto",    Style::default().fg(C_DIM)),
+                        Span::styled(" :: ",     Style::default().fg(C_ORANGE)),
+                        Span::styled("[h/Lt]",   Style::default().fg(C_DIM)),
+                        Span::styled(" Back",    Style::default().fg(C_DIM)),
                     ])
                 }
             },
@@ -807,6 +822,79 @@ fn divider(width: usize) -> Paragraph<'static> {
         "-".repeat(width),
         Style::default().fg(C_DIVIDER),
     ))
+}
+
+// ---------------------------------------------------------------------------
+// mpv key name mapper
+//
+// Converts crossterm KeyCode to mpv key names for keypress IPC commands.
+// Only maps keys mpv recognises — unmapped keys return empty string and
+// are silently dropped in passthrough mode.
+// ---------------------------------------------------------------------------
+
+fn mpv_key_name(code: KeyCode) -> &'static str {
+    match code {
+        KeyCode::Char(' ')   => "SPACE",
+        KeyCode::Enter       => "ENTER",
+        KeyCode::Esc         => "ESC",
+        KeyCode::Backspace   => "BS",
+        KeyCode::Delete      => "DEL",
+        KeyCode::Tab         => "TAB",
+        KeyCode::Up          => "UP",
+        KeyCode::Down        => "DOWN",
+        KeyCode::Left        => "LEFT",
+        KeyCode::Right       => "RIGHT",
+        KeyCode::PageUp      => "PGUP",
+        KeyCode::PageDown    => "PGDWN",
+        KeyCode::Home        => "HOME",
+        KeyCode::End         => "END",
+        KeyCode::F(1)        => "F1",
+        KeyCode::F(2)        => "F2",
+        KeyCode::F(3)        => "F3",
+        KeyCode::F(4)        => "F4",
+        KeyCode::F(5)        => "F5",
+        KeyCode::F(6)        => "F6",
+        KeyCode::F(7)        => "F7",
+        KeyCode::F(8)        => "F8",
+        KeyCode::F(9)        => "F9",
+        KeyCode::F(10)       => "F10",
+        KeyCode::Char('a')   => "a",
+        KeyCode::Char('b')   => "b",
+        KeyCode::Char('c')   => "c",
+        KeyCode::Char('d')   => "d",
+        KeyCode::Char('e')   => "e",
+        KeyCode::Char('f')   => "f",
+        KeyCode::Char('g')   => "g",
+        KeyCode::Char('h')   => "h",
+        KeyCode::Char('i')   => "i",
+        KeyCode::Char('j')   => "j",
+        KeyCode::Char('k')   => "k",
+        KeyCode::Char('l')   => "l",
+        KeyCode::Char('m')   => "m",
+        KeyCode::Char('n')   => "n",
+        KeyCode::Char('o')   => "o",
+        KeyCode::Char('p')   => "p",
+        KeyCode::Char('q')   => "q",
+        KeyCode::Char('r')   => "r",
+        KeyCode::Char('s')   => "s",
+        KeyCode::Char('t')   => "t",
+        KeyCode::Char('u')   => "u",
+        KeyCode::Char('w')   => "w",
+        KeyCode::Char('x')   => "x",
+        KeyCode::Char('y')   => "y",
+        KeyCode::Char('z')   => "z",
+        KeyCode::Char('0')   => "0",
+        KeyCode::Char('1')   => "1",
+        KeyCode::Char('2')   => "2",
+        KeyCode::Char('3')   => "3",
+        KeyCode::Char('4')   => "4",
+        KeyCode::Char('5')   => "5",
+        KeyCode::Char('6')   => "6",
+        KeyCode::Char('7')   => "7",
+        KeyCode::Char('8')   => "8",
+        KeyCode::Char('9')   => "9",
+        _                    => "",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -833,15 +921,20 @@ async fn reload_playlist_cmd(ws_tx: &mut WsSink, pane: &str) {
         serde_json::json!([path.to_string_lossy(), "replace"])).await;
 }
 
-async fn cmd_stop_all(ws_tx: &mut WsSink, pane_order: &[String]) {
-    for pane in pane_order {
-        send_cmd(ws_tx, pane, "stop", serde_json::json!([])).await;
-    }
-}
+async fn cmd_pause_toggle_all(ws_tx: &mut WsSink, panes: &HashMap<String, PaneState>, pane_order: &[String]) {
+    // If anything is playing, pause all.
+    // If everything is paused/stopped, unpause all but muted.
+    let any_playing = panes.values().any(|p| {
+        p.online && !p.idle_active.unwrap_or(true) && !p.paused.unwrap_or(true)
+    });
 
-async fn cmd_start_all(ws_tx: &mut WsSink, pane_order: &[String]) {
     for pane in pane_order {
-        send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", false])).await;
+        if any_playing {
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", true])).await;
+        } else {
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute",  true])).await;
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", false])).await;
+        }
     }
 }
 
@@ -923,13 +1016,24 @@ async fn connect_ws(
         if spawned {
             render_startup(terminal, "Starting daemon...")?;
         } else {
-            render_startup(terminal, "Waiting for daemon...")?;
+            render_startup(terminal, "Waiting for daemon... [q] to cancel")?;
         }
+        let mut key_events = EventStream::new();
         loop {
-            render_startup(terminal, "Waiting for daemon...")?;
-            tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
-            if let Ok((ws, _)) = connect_async(addr).await {
-                return Ok((ws, spawned));
+            render_startup(terminal, "Waiting for daemon... [q] to cancel")?;
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)) => {
+                    if let Ok((ws, _)) = connect_async(addr).await {
+                        return Ok((ws, spawned));
+                    }
+                }
+                key = key_events.next() => {
+                    if let Some(Ok(Event::Key(k))) = key {
+                        if k.code == KeyCode::Char('q') {
+                            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+                        }
+                    }
+                }
             }
         }
     }
@@ -1003,6 +1107,7 @@ enum KeyAction {
     Quit,
     Render,
     RenderDetails,
+    Reconnect,
     Nothing,
 }
 
@@ -1016,8 +1121,36 @@ async fn handle_key(
     ws_tx:  &mut WsSink,
 ) -> io::Result<KeyAction> {
 
-    if k.code == KeyCode::Char('q') && app.details_mode != DetailsMode::Add {
+    // q quits from dashboard, closes details/log back to dashboard
+    if k.code == KeyCode::Char('q') && !app.show_picker {
+        if app.show_details {
+            app.show_details = false;
+            app.details_mode = DetailsMode::Normal;
+            app.status_msg   = None;
+            app.jump_input.clear();
+            app.selected_items.clear();
+            return Ok(KeyAction::Render);
+        }
+        if app.show_log {
+            app.show_log = false;
+            return Ok(KeyAction::Render);
+        }
         return Ok(KeyAction::Quit);
+    }
+
+    // Passthrough mode — v exits, everything else forwards to mpv as keypress
+    if app.passthrough_mode {
+        if k.code == KeyCode::Char('v') {
+            app.passthrough_mode = false;
+            return Ok(KeyAction::Render);
+        }
+        if let Some(pane) = app.selected_name() {
+            let key_str = mpv_key_name(k.code);
+            if !key_str.is_empty() {
+                send_cmd(ws_tx, &pane, "keypress", serde_json::json!([key_str])).await;
+            }
+        }
+        return Ok(KeyAction::Nothing);
     }
 
     // ================================================================
@@ -1045,6 +1178,61 @@ async fn handle_key(
                 KeyCode::Esc => {
                     app.jump_input.clear();
                     app.details_mode = DetailsMode::Normal;
+                }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::RenderDetails);
+        }
+
+        // -- Confirm mode (Play Now / Queue Next) --
+        if app.details_mode == DetailsMode::Confirm {
+            match k.code {
+                KeyCode::Enter => {
+                    if let Some(pane) = app.selected_name() {
+                        let ps = app.panes.get(&pane);
+                        if ps.map(|p| p.idle_active.unwrap_or(true)).unwrap_or(true) {
+                            reload_playlist_cmd(ws_tx, &pane).await;
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        send_cmd(ws_tx, &pane, "playlist-play-index",
+                            serde_json::json!([app.playlist_sel])).await;
+                        send_cmd(ws_tx, &pane, "set_property",
+                            serde_json::json!(["pause", false])).await;
+                    }
+                    app.details_mode = DetailsMode::Normal;
+                    app.status_msg   = None;
+                }
+                KeyCode::Char('n') => {
+                    if let Some(pane) = app.selected_name() {
+                        let current_pos = app.current_playlist_pos();
+                        let insert_at = if current_pos >= 0 {
+                            (current_pos as usize + 1).min(app.playlist_items.len())
+                        } else {
+                            0
+                        };
+                        let sel = app.playlist_sel;
+                        if sel != insert_at && sel + 1 != insert_at {
+                            let item = app.playlist_items[sel].clone();
+                            let mut items = app.playlist_items.clone();
+                            items.remove(sel);
+                            let adj = if sel < insert_at { insert_at - 1 } else { insert_at };
+                            items.insert(adj, item);
+                            match write_m3u(&pane, &items) {
+                                Ok(_) => {
+                                    app.playlist_items = items;
+                                    app.playlist_sel   = adj;
+                                    reload_playlist_cmd(ws_tx, &pane).await;
+                                    app.status_msg = Some("Queued next".to_string());
+                                }
+                                Err(e) => { app.status_msg = Some(format!("Queue failed: {}", e)); }
+                            }
+                        }
+                    }
+                    app.details_mode = DetailsMode::Normal;
+                }
+                KeyCode::Esc => {
+                    app.details_mode = DetailsMode::Normal;
+                    app.status_msg   = None;
                 }
                 _ => return Ok(KeyAction::Nothing),
             }
@@ -1106,7 +1294,7 @@ async fn handle_key(
                     KeyCode::Down  | KeyCode::Char('j') => { send_cmd(ws_tx, &pane, "seek", serde_json::json!([-60, "relative"])).await; }
                     KeyCode::Char('0')              => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume",  5])).await; }
                     KeyCode::Char('9')              => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume", -5])).await; }
-                    KeyCode::Char('v')              => { /* TODO: advanced passthrough */ }
+                    KeyCode::Char('v')              => { app.passthrough_mode = true; }
                     KeyCode::Tab                    => {
                         app.command_mode = false;
                         app.status_msg   = None;
@@ -1130,49 +1318,10 @@ async fn handle_key(
         }
 
         match k.code {
-            // Enter on item — Play Now
+            // Enter on item — open confirm prompt
             KeyCode::Enter => {
-                if let Some(pane) = app.selected_name() {
-                    let ps = app.panes.get(&pane);
-                    if ps.map(|p| p.idle_active.unwrap_or(true)).unwrap_or(true) {
-                        reload_playlist_cmd(ws_tx, &pane).await;
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    send_cmd(ws_tx, &pane, "playlist-play-index",
-                        serde_json::json!([app.playlist_sel])).await;
-                    send_cmd(ws_tx, &pane, "set_property",
-                        serde_json::json!(["pause", false])).await;
-                    app.status_msg = None;
-                }
-            }
-
-            // n — Queue Next (move selected item to current_pos + 1)
-            KeyCode::Char('n') => {
-                if let Some(pane) = app.selected_name() {
-                    let current_pos = app.current_playlist_pos();
-                    let insert_at = if current_pos >= 0 {
-                        (current_pos as usize + 1).min(app.playlist_items.len())
-                    } else {
-                        0
-                    };
-                    let sel = app.playlist_sel;
-                    if sel != insert_at && sel + 1 != insert_at {
-                        let item = app.playlist_items[sel].clone();
-                        let mut items = app.playlist_items.clone();
-                        items.remove(sel);
-                        let adj = if sel < insert_at { insert_at - 1 } else { insert_at };
-                        items.insert(adj, item);
-                        match write_m3u(&pane, &items) {
-                            Ok(_) => {
-                                app.playlist_items = items;
-                                app.playlist_sel   = adj;
-                                reload_playlist_cmd(ws_tx, &pane).await;
-                                app.status_msg = Some("Queued next".to_string());
-                            }
-                            Err(e) => { app.status_msg = Some(format!("Queue failed: {}", e)); }
-                        }
-                    }
-                }
+                app.details_mode = DetailsMode::Confirm;
+                app.status_msg   = None;
             }
 
             // Toggle command mode
@@ -1413,14 +1562,39 @@ async fn handle_key(
         return Ok(KeyAction::Render);
     }
 
-    if k.code == KeyCode::Char('W') {
+    if k.code == KeyCode::Char('W') && !app.is_remote {
         app.picker_sel  = app.layouts.iter().position(|l| l == &app.layout).unwrap_or(0);
         app.show_picker = true;
         return Ok(KeyAction::Render);
     }
 
-    if k.code == KeyCode::Right ||
-       (k.code == KeyCode::Char('l') && !app.command_mode) {
+    if k.code == KeyCode::Char('C') {
+        // Re-run host resolution — reconnect to a different node
+        return Ok(KeyAction::Reconnect);
+    }
+
+    if !app.command_mode && !app.show_details && !app.show_picker {
+        if k.code == KeyCode::Left || k.code == KeyCode::Char('h') {
+            app.show_log = true;
+            return Ok(KeyAction::Render);
+        }
+    }
+
+    if app.show_log && !app.show_details {
+        if k.code == KeyCode::Right || k.code == KeyCode::Char('l') ||
+           k.code == KeyCode::Char('j') || k.code == KeyCode::Down {
+            app.show_log = false;
+            return Ok(KeyAction::Render);
+        }
+        if k.code == KeyCode::Char('q') {
+            app.show_log = false;
+            return Ok(KeyAction::Render);
+        }
+        return Ok(KeyAction::Nothing);
+    }
+
+    if !app.command_mode && !app.show_log && (k.code == KeyCode::Right ||
+       k.code == KeyCode::Char('l')) {
         if let Some(pane) = app.selected_name() {
             app.playlist_items = read_m3u(&pane);
             app.playlist_sel   = app.panes.get(&pane)
@@ -1437,11 +1611,6 @@ async fn handle_key(
 
     if k.code == KeyCode::Tab {
         app.command_mode = !app.command_mode;
-        return Ok(KeyAction::Render);
-    }
-
-    if k.code == KeyCode::Char('L') {
-        app.show_log = !app.show_log;
         return Ok(KeyAction::Render);
     }
 
@@ -1474,14 +1643,9 @@ async fn handle_key(
                 }
                 return Ok(KeyAction::Render);
             }
-            KeyCode::Char('X') => {
-                let pane_order = app.pane_order.clone();
-                cmd_stop_all(ws_tx, &pane_order).await;
-                return Ok(KeyAction::Render);
-            }
             KeyCode::Char('P') => {
                 let pane_order = app.pane_order.clone();
-                cmd_start_all(ws_tx, &pane_order).await;
+                cmd_pause_toggle_all(ws_tx, &app.panes, &pane_order).await;
                 return Ok(KeyAction::Render);
             }
             _ => {}
@@ -1501,7 +1665,7 @@ async fn handle_key(
                 KeyCode::Down  | KeyCode::Char('j') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([-60, "relative"])).await; }
                 KeyCode::Char('0')              => { send_cmd(ws_tx, &pane, "add",          serde_json::json!(["volume",  5])).await; }
                 KeyCode::Char('9')              => { send_cmd(ws_tx, &pane, "add",          serde_json::json!(["volume", -5])).await; }
-                KeyCode::Char('v')              => { /* TODO: advanced passthrough mode */ }
+                KeyCode::Char('v')              => { app.passthrough_mode = true; }
                 _ => return Ok(KeyAction::Nothing),
             }
             return Ok(KeyAction::Render);
@@ -1519,75 +1683,91 @@ async fn handle_key(
 // Pane online states are reset on reconnect since we'll get fresh events.
 // ---------------------------------------------------------------------------
 
-async fn run(terminal: &mut Term, addr: &str) -> io::Result<()> {
+async fn run(terminal: &mut Term) -> io::Result<()> {
     let mut app        = App::new();
     let mut key_events = EventStream::new();
 
-    'reconnect: loop {
-
-        let ws = match connect_ws(terminal, addr).await {
-            Ok((ws, spawned)) => {
-                if spawned { app.owns_daemon = true; }
-                ws
-            }
-            Err(_) => {
-                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-                continue 'reconnect;
-            }
+    'outer: loop {
+        let addr = match resolve_daemon_addr(terminal).await? {
+            Some(a) => a,
+            None    => return Ok(()),
         };
 
-        // Clear pane state on reconnect — node:snapshot will repopulate fresh.
-        app.pane_order.clear();
-        app.panes.clear();
-        app.selected = 0;
+        'reconnect: loop {
 
-        let (mut ws_tx, mut ws_rx) = ws.split();
+            let ws = match connect_ws(terminal, &addr).await {
+                Ok((ws, spawned)) => {
+                    if spawned { app.owns_daemon = true; }
+                    app.is_remote = addr != LOCAL_ADDR;
+                    ws
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {
+                    // User pressed q on the waiting screen — go back to host picker
+                    break 'reconnect;
+                }
+                Err(_) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                    continue 'reconnect;
+                }
+            };
 
-        loop {
-            tokio::select! {
+            // Clear pane state on reconnect — node:snapshot will repopulate fresh.
+            app.pane_order.clear();
+            app.panes.clear();
+            app.selected = 0;
 
-                msg = ws_rx.next() => {
-                    match msg {
-                        Some(Ok(Message::Text(text))) => {
-                            let signal = process_event(&mut app, &text);
-                            if app.show_details { render_details(terminal, &app)?; }
-                            else                { render(terminal, &app)?;         }
-                            if signal == Some("node:down") {
-                                tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+            let (mut ws_tx, mut ws_rx) = ws.split();
+
+            loop {
+                tokio::select! {
+
+                    msg = ws_rx.next() => {
+                        match msg {
+                            Some(Ok(Message::Text(text))) => {
+                                let signal = process_event(&mut app, &text);
+                                if app.show_details { render_details(terminal, &app)?; }
+                                else                { render(terminal, &app)?;         }
+                                if signal == Some("node:down") {
+                                    tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+                                    continue 'reconnect;
+                                }
+                            }
+                            Some(Err(_)) | None => {
+                                tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
                                 continue 'reconnect;
                             }
+                            _ => {}
                         }
-                        Some(Err(_)) | None => {
-                            tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-                            continue 'reconnect;
-                        }
-                        _ => {}
                     }
-                }
 
-                key = key_events.next() => {
-                    match key {
-                        Some(Ok(Event::Key(k))) => {
-                            match handle_key(&mut app, k, &mut ws_tx).await? {
-                                KeyAction::Quit => {
-                                    if app.owns_daemon {
-                                        send_node_cmd(&mut ws_tx, "panebot:shutdown",
-                                            serde_json::json!({})).await;
-                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    key = key_events.next() => {
+                        match key {
+                            Some(Ok(Event::Key(k))) => {
+                                match handle_key(&mut app, k, &mut ws_tx).await? {
+                                    KeyAction::Quit => {
+                                        if app.owns_daemon {
+                                            send_node_cmd(&mut ws_tx, "panebot:shutdown",
+                                                serde_json::json!({})).await;
+                                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                        }
+                                        break 'outer;
                                     }
-                                    break 'reconnect;
+                                    KeyAction::Reconnect => {
+                                        // Drop connection, go back to host picker
+                                        break 'reconnect;
+                                    }
+                                    KeyAction::Render        => render(terminal, &app)?,
+                                    KeyAction::RenderDetails => {
+                                        if app.show_details { render_details(terminal, &app)?; }
+                                        else                { render(terminal, &app)?;         }
+                                    }
+                                    KeyAction::Nothing => {}
                                 }
-                                KeyAction::Render        => render(terminal, &app)?,
-                                KeyAction::RenderDetails => {
-                                    if app.show_details { render_details(terminal, &app)?; }
-                                    else                { render(terminal, &app)?;         }
-                                }
-                                KeyAction::Nothing => {}
                             }
+                            Some(Err(e)) => return Err(e),
+                            None         => break 'outer,
+                            _            => {}
                         }
-                        Some(Err(e)) => return Err(e),
-                        None         => break 'reconnect,
-                        _            => {}
                     }
                 }
             }
@@ -1610,11 +1790,7 @@ async fn main() -> io::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let result = async {
-        let addr = match resolve_daemon_addr(&mut terminal).await? {
-            Some(a) => a,
-            None    => return Ok(()),
-        };
-        run(&mut terminal, &addr).await
+        run(&mut terminal).await
     }.await;
 
     disable_raw_mode()?;

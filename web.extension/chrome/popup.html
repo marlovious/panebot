@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      width: 320px;
+      font-family: monospace;
+      font-size: 13px;
+      background: #0a1010;
+      color: #8ca0a0;
+    }
+
+    #header {
+      padding: 8px 10px;
+      border-bottom: 1px solid #283a3a;
+      color: #e08030;
+      font-weight: bold;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    #header span { color: #3ca0a0; font-size: 11px; font-weight: normal; }
+
+    #url-bar {
+      padding: 6px 10px;
+      border-bottom: 1px solid #283a3a;
+    }
+
+    #url-display {
+      width: 100%;
+      background: #0f1a1a;
+      border: 1px solid #283a3a;
+      color: #8ca0a0;
+      font-family: monospace;
+      font-size: 11px;
+      padding: 4px 6px;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    #mode-bar {
+      padding: 6px 10px;
+      border-bottom: 1px solid #283a3a;
+      display: flex;
+      gap: 6px;
+    }
+
+    .mode-btn {
+      flex: 1;
+      padding: 4px;
+      background: #0f1a1a;
+      border: 1px solid #283a3a;
+      color: #8ca0a0;
+      font-family: monospace;
+      font-size: 11px;
+      cursor: pointer;
+      text-align: center;
+    }
+
+    .mode-btn.active {
+      border-color: #e08030;
+      color: #e08030;
+    }
+
+    #pane-list {
+      max-height: 280px;
+      overflow-y: auto;
+    }
+
+    .host-label {
+      padding: 4px 10px;
+      font-size: 10px;
+      color: #3ca0a0;
+      border-bottom: 1px solid #1a2828;
+      background: #0c1616;
+    }
+
+    .pane-row {
+      padding: 7px 10px;
+      border-bottom: 1px solid #1a2828;
+      cursor: pointer;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .pane-row:hover { background: #142020; }
+    .pane-row.selected { background: #142020; border-left: 2px solid #e08030; }
+
+    .pane-name { color: #dcdcdc; }
+    .pane-status { font-size: 10px; }
+    .pane-status.playing { color: #3cb464; }
+    .pane-status.paused  { color: #8ca0a0; }
+    .pane-status.stopped { color: #644040; }
+    .pane-status.offline { color: #803030; }
+
+    #footer {
+      padding: 8px 10px;
+      border-top: 1px solid #283a3a;
+      display: flex;
+      gap: 6px;
+    }
+
+    #send-btn {
+      flex: 1;
+      padding: 6px;
+      background: #1a2a0a;
+      border: 1px solid #3a5a1a;
+      color: #80c040;
+      font-family: monospace;
+      font-size: 12px;
+      cursor: pointer;
+      font-weight: bold;
+    }
+
+    #send-btn:hover { background: #243a10; }
+    #send-btn:disabled { opacity: 0.4; cursor: default; }
+
+    #status {
+      padding: 6px 10px;
+      font-size: 11px;
+      min-height: 22px;
+      color: #3ca0a0;
+    }
+
+    #status.error { color: #c03030; }
+    #status.ok    { color: #3cb464; }
+
+    #connecting {
+      padding: 20px 10px;
+      text-align: center;
+      color: #3ca0a0;
+    }
+  </style>
+</head>
+<body>
+  <div id="header">
+    [PaneBot] <span id="host-label">connecting...</span>
+  </div>
+
+  <div id="url-bar">
+    <div id="url-display">...</div>
+  </div>
+
+  <div id="mode-bar">
+    <button class="mode-btn active" data-mode="append-play" id="mode-append-play">Queue / Play</button>
+    <button class="mode-btn"        data-mode="replace"      id="mode-replace">Replace</button>
+  </div>
+
+  <div id="pane-list">
+    <div id="connecting">Connecting to daemon...</div>
+  </div>
+
+  <div id="status"></div>
+
+  <div id="footer">
+    <button id="send-btn" disabled>Send to Pane</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

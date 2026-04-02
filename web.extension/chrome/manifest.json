@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "PaneBot",
+  "version": "0.1.0",
+  "description": "Send URLs to PaneBot panes",
+  "permissions": ["activeTab", "contextMenus", "storage"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "PaneBot"
+  }
+}
