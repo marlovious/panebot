@@ -18,8 +18,7 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 use panebot_lib::{
-    layouts_dir, pane_playlist, read_m3u, write_m3u, m3u_append, m3u_remove, m3u_crop,
-    save_playlist, home_dir, config_dir, load_hosts, Host,
+    layouts_dir, home_dir, config_dir, load_hosts, Host,
 };
 
 // ---------------------------------------------------------------------------
@@ -113,6 +112,7 @@ enum DetailsMode {
     Normal,
     Jump,
     Add,
+    Save,     // filename prompt for saving current playlist
     Confirm,  // waiting for Enter=Play or n=Queue
 }
 
@@ -292,6 +292,38 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
             if let Some(layout) = v["layout"].as_str() {
                 app.layout = layout.to_string();
             }
+        }
+
+        "node:playlist" => {
+            let pane = v["pane"].as_str().unwrap_or("");
+            if let Some(sel) = app.pane_order.iter().position(|n| n == pane) {
+                if sel == app.selected && app.show_details {
+                    if let Some(items) = v["items"].as_array() {
+                        app.playlist_items = items.iter()
+                            .filter_map(|i| {
+                                let filename = i["filename"].as_str()?;
+                                // Use title if present and non-empty, else fall back to filename
+                                let display = i["title"].as_str()
+                                    .filter(|t| !t.is_empty())
+                                    .unwrap_or(filename)
+                                    .to_string();
+                                Some(display)
+                            })
+                            .collect();
+                        app.playlist_sel = app.panes.get(pane)
+                            .and_then(|p| p.playlist_pos)
+                            .filter(|&pos| pos >= 0)
+                            .map(|pos| pos as usize)
+                            .unwrap_or(0);
+                        app.status_msg = None;
+                    }
+                }
+            }
+        }
+
+        "node:playlist-saved" => {
+            let path = v["path"].as_str().unwrap_or("unknown");
+            app.status_msg = Some(format!("Saved to {}", path));
         }
 
         _ => {}
@@ -677,10 +709,7 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                 let is_current  = i as i64 == current_pos;
                 let is_sel      = i == app.playlist_sel;
                 let is_marked   = app.selected_items.contains(&i);
-                let display     = {
-                    let t = entry.trim_end_matches('/');
-                    t.split('/').last().unwrap_or(entry.as_str())
-                };
+                let display = entry.as_str();
 
                 let cursor = if is_sel {
                     Span::styled(">> ", Style::default().fg(C_ORANGE))
@@ -734,6 +763,12 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("Add: ", Style::default().fg(C_HINT)),
                 Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
                 Span::styled("  [Enter] Add  [Esc] Cancel", Style::default().fg(C_DIM)),
+            ]),
+
+            DetailsMode::Save => Line::from(vec![
+                Span::styled("Save as: ", Style::default().fg(C_HINT)),
+                Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled(".m3u  [Enter] Save  [Esc] Cancel", Style::default().fg(C_DIM)),
             ]),
 
             DetailsMode::Normal => {
@@ -913,12 +948,6 @@ async fn send_node_cmd(ws_tx: &mut WsSink, cmd: &str, params: serde_json::Value)
     let mut msg    = params;
     msg["command"] = serde_json::Value::String(cmd.to_string());
     let _ = ws_tx.send(Message::Text(msg.to_string())).await;
-}
-
-async fn reload_playlist_cmd(ws_tx: &mut WsSink, pane: &str) {
-    let path = pane_playlist(pane);
-    send_cmd(ws_tx, pane, "loadlist",
-        serde_json::json!([path.to_string_lossy(), "replace"])).await;
 }
 
 async fn cmd_pause_toggle_all(ws_tx: &mut WsSink, panes: &HashMap<String, PaneState>, pane_order: &[String]) {
@@ -1189,11 +1218,6 @@ async fn handle_key(
             match k.code {
                 KeyCode::Enter => {
                     if let Some(pane) = app.selected_name() {
-                        let ps = app.panes.get(&pane);
-                        if ps.map(|p| p.idle_active.unwrap_or(true)).unwrap_or(true) {
-                            reload_playlist_cmd(ws_tx, &pane).await;
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        }
                         send_cmd(ws_tx, &pane, "playlist-play-index",
                             serde_json::json!([app.playlist_sel])).await;
                         send_cmd(ws_tx, &pane, "set_property",
@@ -1212,20 +1236,11 @@ async fn handle_key(
                         };
                         let sel = app.playlist_sel;
                         if sel != insert_at && sel + 1 != insert_at {
-                            let item = app.playlist_items[sel].clone();
-                            let mut items = app.playlist_items.clone();
-                            items.remove(sel);
-                            let adj = if sel < insert_at { insert_at - 1 } else { insert_at };
-                            items.insert(adj, item);
-                            match write_m3u(&pane, &items) {
-                                Ok(_) => {
-                                    app.playlist_items = items;
-                                    app.playlist_sel   = adj;
-                                    reload_playlist_cmd(ws_tx, &pane).await;
-                                    app.status_msg = Some("Queued next".to_string());
-                                }
-                                Err(e) => { app.status_msg = Some(format!("Queue failed: {}", e)); }
-                            }
+                            send_cmd(ws_tx, &pane, "playlist-move",
+                                serde_json::json!([sel, insert_at])).await;
+                            send_node_cmd(ws_tx, "panebot:playlist-get",
+                                serde_json::json!({"pane": pane})).await;
+                            app.status_msg = Some("Queued next".to_string());
                         }
                     }
                     app.details_mode = DetailsMode::Normal;
@@ -1233,6 +1248,32 @@ async fn handle_key(
                 KeyCode::Esc => {
                     app.details_mode = DetailsMode::Normal;
                     app.status_msg   = None;
+                }
+                _ => return Ok(KeyAction::Nothing),
+            }
+            return Ok(KeyAction::RenderDetails);
+        }
+
+        // -- Save mode (filename prompt) --
+        if app.details_mode == DetailsMode::Save {
+            match k.code {
+                KeyCode::Char(c) => { app.add_input.push(c); }
+                KeyCode::Backspace => { app.add_input.pop(); }
+                KeyCode::Enter => {
+                    let name = app.add_input.trim().to_string();
+                    if !name.is_empty() {
+                        if let Some(pane) = app.selected_name() {
+                            let path = format!("{}/{}.m3u", app.home, name);
+                            send_node_cmd(ws_tx, "panebot:playlist-save",
+                                serde_json::json!({"pane": pane, "path": path})).await;
+                        }
+                    }
+                    app.add_input.clear();
+                    app.details_mode = DetailsMode::Normal;
+                }
+                KeyCode::Esc => {
+                    app.add_input.clear();
+                    app.details_mode = DetailsMode::Normal;
                 }
                 _ => return Ok(KeyAction::Nothing),
             }
@@ -1257,15 +1298,10 @@ async fn handle_key(
                             } else {
                                 entry.clone()
                             };
-                            match m3u_append(&pane, &expanded) {
-                                Ok(items) => {
-                                    app.playlist_items = items;
-                                    reload_playlist_cmd(ws_tx, &pane).await;
-                                }
-                                Err(e) => {
-                                    app.status_msg = Some(format!("Add failed: {}", e));
-                                }
-                            }
+                            send_cmd(ws_tx, &pane, "loadfile",
+                                serde_json::json!([expanded, "append"])).await;
+                            send_node_cmd(ws_tx, "panebot:playlist-get",
+                                serde_json::json!({"pane": pane})).await;
                         }
                     }
                     app.add_input.clear();
@@ -1412,27 +1448,21 @@ async fn handle_key(
                         v
                     };
 
-                    // Check none of the targets are currently playing
                     if targets.iter().any(|&i| current_pos >= 0 && i as i64 == current_pos) {
                         app.status_msg = Some("Cannot remove playing item".to_string());
                     } else {
-                        let mut items = app.playlist_items.clone();
-                        // Remove in reverse order to preserve indices
+                        // Remove in reverse order so indices stay valid
                         for &idx in targets.iter().rev() {
-                            if idx < items.len() { items.remove(idx); }
+                            send_cmd(ws_tx, &pane, "playlist-remove",
+                                serde_json::json!([idx])).await;
                         }
-                        match write_m3u(&pane, &items) {
-                            Ok(_) => {
-                                app.playlist_items = items;
-                                app.selected_items.clear();
-                                app.playlist_sel = app.playlist_sel.min(
-                                    app.playlist_items.len().saturating_sub(1)
-                                );
-                                reload_playlist_cmd(ws_tx, &pane).await;
-                                app.status_msg = None;
-                            }
-                            Err(e) => { app.status_msg = Some(format!("Delete failed: {}", e)); }
-                        }
+                        app.selected_items.clear();
+                        app.playlist_sel = app.playlist_sel
+                            .min(app.playlist_items.len().saturating_sub(targets.len()).saturating_sub(1));
+                        // Refresh playlist view
+                        send_node_cmd(ws_tx, "panebot:playlist-get",
+                            serde_json::json!({"pane": pane})).await;
+                        app.status_msg = None;
                     }
                 }
             }
@@ -1446,85 +1476,60 @@ async fn handle_key(
                         let dest = app.playlist_sel;
                         let mut targets: Vec<usize> = app.selected_items.iter().cloned().collect();
                         targets.sort_unstable();
-
-                        // Build new list: extract marked items, insert at dest
-                        let marked: Vec<String> = targets.iter()
-                            .filter_map(|&i| app.playlist_items.get(i).cloned())
-                            .collect();
-                        let mut rest: Vec<String> = app.playlist_items.iter().enumerate()
-                            .filter(|(i, _)| !app.selected_items.contains(i))
-                            .map(|(_, s)| s.clone())
-                            .collect();
-
-                        // Adjust dest for removed items before it
-                        let removed_before = targets.iter().filter(|&&i| i < dest).count();
-                        let insert_at = dest.saturating_sub(removed_before).min(rest.len());
-                        for (j, item) in marked.into_iter().enumerate() {
-                            rest.insert(insert_at + j, item);
+                        // Move each item to dest via IPC — adjust dest for each move
+                        let mut adj_dest = dest;
+                        for &idx in &targets {
+                            send_cmd(ws_tx, &pane, "playlist-move",
+                                serde_json::json!([idx, adj_dest])).await;
+                            if idx < adj_dest { adj_dest = adj_dest.saturating_sub(1); }
                         }
-
-                        match write_m3u(&pane, &rest) {
-                            Ok(_) => {
-                                app.playlist_items = rest;
-                                app.selected_items.clear();
-                                app.playlist_sel = insert_at;
-                                reload_playlist_cmd(ws_tx, &pane).await;
-                                app.status_msg = None;
-                            }
-                            Err(e) => { app.status_msg = Some(format!("Move failed: {}", e)); }
-                        }
+                        app.selected_items.clear();
+                        app.playlist_sel = dest;
+                        send_node_cmd(ws_tx, "panebot:playlist-get",
+                            serde_json::json!({"pane": pane})).await;
+                        app.status_msg = None;
                     }
                 }
             }
 
-            // Crop — multi-aware: if items selected keep those, else keep playing item
+            // Crop — keep marked items or currently playing item, remove rest
             KeyCode::Char('C') => {
                 if let Some(pane) = app.selected_name() {
-                    if app.selected_items.is_empty() {
-                        let current_pos = app.current_playlist_pos();
-                        match m3u_crop(&pane, current_pos) {
-                            Ok(Some(items)) => {
-                                app.playlist_items = items;
-                                app.playlist_sel   = 0;
-                                reload_playlist_cmd(ws_tx, &pane).await;
-                                app.status_msg = None;
-                            }
-                            Ok(None) => { app.status_msg = Some("Nothing playing to crop around".to_string()); }
-                            Err(e)   => { app.status_msg = Some(format!("Crop failed: {}", e)); }
-                        }
+                    let keep: Vec<usize> = if !app.selected_items.is_empty() {
+                        let mut v: Vec<usize> = app.selected_items.iter().cloned().collect();
+                        v.sort_unstable();
+                        v
                     } else {
-                        let mut targets: Vec<usize> = app.selected_items.iter().cloned().collect();
-                        targets.sort_unstable();
-                        let kept: Vec<String> = targets.iter()
-                            .filter_map(|&i| app.playlist_items.get(i).cloned())
-                            .collect();
-                        match write_m3u(&pane, &kept) {
-                            Ok(_) => {
-                                app.playlist_items = kept;
-                                app.selected_items.clear();
-                                app.playlist_sel = 0;
-                                reload_playlist_cmd(ws_tx, &pane).await;
-                                app.status_msg = None;
-                            }
-                            Err(e) => { app.status_msg = Some(format!("Crop failed: {}", e)); }
+                        let pos = app.current_playlist_pos();
+                        if pos < 0 {
+                            app.status_msg = Some("Nothing playing to crop around".to_string());
+                            return Ok(KeyAction::RenderDetails);
                         }
+                        vec![pos as usize]
+                    };
+                    // Remove everything not in keep, in reverse order
+                    let total = app.playlist_items.len();
+                    let mut to_remove: Vec<usize> = (0..total)
+                        .filter(|i| !keep.contains(i))
+                        .collect();
+                    to_remove.sort_unstable();
+                    for &idx in to_remove.iter().rev() {
+                        send_cmd(ws_tx, &pane, "playlist-remove",
+                            serde_json::json!([idx])).await;
                     }
+                    app.selected_items.clear();
+                    app.playlist_sel = 0;
+                    send_node_cmd(ws_tx, "panebot:playlist-get",
+                        serde_json::json!({"pane": pane})).await;
+                    app.status_msg = None;
                 }
             }
 
-            // Save playlist
+            // Save playlist — open filename prompt
             KeyCode::Char('S') => {
-                if let Some(pane) = app.selected_name() {
-                    match save_playlist(&pane) {
-                        Ok(n) => {
-                            app.playlist_items = read_m3u(&pane);
-                            app.status_msg = Some(format!("Saved {} items", n));
-                        }
-                        Err(e) => {
-                            app.status_msg = Some(format!("Save failed: {}", e));
-                        }
-                    }
-                }
+                app.details_mode = DetailsMode::Save;
+                app.add_input.clear();
+                app.status_msg   = None;
             }
 
             _ => return Ok(KeyAction::Nothing),
@@ -1595,15 +1600,18 @@ async fn handle_key(
 
     if !app.command_mode && !app.show_log && (k.code == KeyCode::Right ||
        k.code == KeyCode::Char('l')) {
-        if let Some(pane) = app.selected_name() {
-            app.playlist_items = read_m3u(&pane);
-            app.playlist_sel   = app.panes.get(&pane)
-                .map(|p| p.playlist_pos.unwrap_or(0).max(0) as usize)
-                .unwrap_or(0);
+        if app.selected_name().is_some() {
+            app.playlist_items.clear();
+            app.playlist_sel   = 0;
             app.selected_items.clear();
             app.show_details   = true;
             app.details_mode   = DetailsMode::Normal;
-            app.status_msg     = None;
+            app.status_msg     = Some("Loading playlist...".to_string());
+            // Request playlist from daemon via IPC
+            if let Some(pane) = app.selected_name() {
+                send_node_cmd(ws_tx, "panebot:playlist-get",
+                    serde_json::json!({"pane": pane})).await;
+            }
             return Ok(KeyAction::RenderDetails);
         }
         return Ok(KeyAction::Nothing);

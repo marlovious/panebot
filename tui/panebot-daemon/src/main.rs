@@ -497,6 +497,13 @@ async fn monitor_pane(
                         "property": prop,
                         "value":    v["data"],
                     }).to_string());
+                } else if v["error"] == "success" && v["data"].is_array() {
+                    // Response to get_property playlist — broadcast as node:playlist
+                    let _ = tx_r.send(serde_json::json!({
+                        "event": "node:playlist",
+                        "pane":  mpv_name,
+                        "items": v["data"],
+                    }).to_string());
                 }
             }
         });
@@ -725,15 +732,31 @@ async fn handle_node_command(
             }
         }
 
-        "panebot:reload-playlist" => {
+        "panebot:playlist-get" => {
             let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
-            let playlist  = pane_playlist(&pane_name);
+            let sender = cmds.lock().unwrap().get(&pane_name).cloned();
+            if let Some(s) = sender {
+                let cmd = serde_json::json!({"command":["get_property","playlist"]}).to_string();
+                let _ = s.send(cmd).await;
+            }
+        }
+
+        "panebot:playlist-save" => {
+            // Save mpv's current playlist to a user-specified file.
+            // Expects: { pane, path }
+            let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
+            let save_path = match v["path"].as_str() { Some(p) => p.to_string(), None => return };
             let sender    = cmds.lock().unwrap().get(&pane_name).cloned();
             if let Some(s) = sender {
                 let cmd = serde_json::json!({
-                    "command": ["loadlist", playlist.to_string_lossy(), "replace"]
+                    "command": ["playlist-save", save_path]
                 }).to_string();
                 let _ = s.send(cmd).await;
+                let _ = tx.send(serde_json::json!({
+                    "event": "node:playlist-saved",
+                    "pane":  pane_name,
+                    "path":  save_path,
+                }).to_string());
             }
         }
 
