@@ -107,7 +107,6 @@ struct App {
     selected:         usize,
     hostname:         String,
     platform:         String,
-    ip:               String,
     layout:           String,
     home:             String,
     owns_daemon:      bool,
@@ -136,7 +135,6 @@ impl App {
             selected:         0,
             hostname:         String::new(),
             platform:         String::new(),
-            ip:               String::new(),
             layout:           String::new(),
             home:             home_dir(),
             owns_daemon:      false,
@@ -219,7 +217,6 @@ fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
         "node:snapshot" => {
             app.hostname = v["hostname"].as_str().unwrap_or("").to_string();
             app.platform = v["platform"].as_str().unwrap_or("").to_string();
-            app.ip       = v["ip"].as_str().unwrap_or("127.0.0.1").to_string();
             app.layout   = v["layout"].as_str().unwrap_or("").to_string();
             app.home     = v["home"].as_str().unwrap_or("").to_string();
             app.load_layouts();
@@ -404,15 +401,11 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
 
         f.render_widget(Paragraph::new(Line::from(vec![
             Span::styled("[PaneBot]", Style::default().fg(C_ORANGE)), sep_dim(),
-            Span::styled(format!("[{}]", app.hostname.chars().take(10).collect::<String>()), Style::default().fg(C_HINT)),
+            Span::styled(format!("Active Panes: {}/{}", app.active_count(), app.pane_order.len()), Style::default().fg(C_HINT)),
             sep_dim(),
-            Span::styled(app.ip.clone(), Style::default().fg(C_DIM)),
+            Span::styled(format!("Layout: {}", app.layout), Style::default().fg(C_CYAN)),
             sep_dim(),
-            Span::styled("Panes:", Style::default().fg(C_DIM)),
-            Span::styled(format!(" {}/{}", app.active_count(), app.pane_order.len()), Style::default().fg(C_CYAN)),
-            sep_dim(),
-            Span::styled("Layout:", Style::default().fg(C_DIM)),
-            Span::styled(format!(" {}", app.layout), Style::default().fg(C_CYAN)),
+            Span::styled(format!("{} [{}]", app.hostname, app.platform), Style::default().fg(C_DIM)),
         ])), chunks[0]);
         f.render_widget(divider(size.width as usize), chunks[1]);
 
@@ -443,13 +436,13 @@ fn render_log_body(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         .map(|line| {
             if let Some(rest) = line.strip_prefix('[') {
                 if let Some(mid) = rest.find("] [") {
-                    let host = &rest[..mid];
+                    let ts   = &rest[..mid];
                     let tail = &rest[mid + 3..];
                     if let Some(end) = tail.find(']') {
                         return ListItem::new(Line::from(vec![
-                            Span::styled(format!("[{}]", host),            Style::default().fg(C_ORANGE)),
-                            Span::styled(format!(" [{:}]", &tail[..end]), Style::default().fg(C_HINT)),
-                            Span::styled(tail[end + 1..].to_string(),      Style::default().fg(C_DIM)),
+                            Span::styled(format!("[{}] ", ts),        Style::default().fg(C_DIM)),
+                            Span::styled(format!("[{}]", &tail[..end]), Style::default().fg(C_HINT)),
+                            Span::styled(tail[end + 1..].to_string(), Style::default().fg(C_DIM)),
                         ]));
                     }
                 }
@@ -591,12 +584,13 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             ]),
             DetailsMode::Add     => Line::from(vec![
                 Span::styled("Add: ", Style::default().fg(C_HINT)),
-                Span::styled(app.add_input.chars().rev().take(80).collect::<String>().chars().rev().collect::<String>(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                fdim("  [Enter] Add  [Esc] Cancel"),
             ]),
             DetailsMode::Save    => Line::from(vec![
                 Span::styled("Save as: ", Style::default().fg(C_HINT)),
-                Span::styled(app.add_input.chars().rev().take(60).collect::<String>().chars().rev().collect::<String>(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
-                fdim(".m3u"),
+                Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                fdim(".m3u  [Enter] Save  [Esc] Cancel"),
             ]),
             DetailsMode::Normal  => {
                 if let Some(msg) = &app.status_msg {
@@ -820,7 +814,7 @@ async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx
 
     if app.details_mode == DetailsMode::Save {
         match k.code {
-            KeyCode::Char(c)   => { if app.add_input.len() < 2048 { app.add_input.push(c); } }
+            KeyCode::Char(c)   => { app.add_input.push(c); }
             KeyCode::Backspace => { app.add_input.pop(); }
             KeyCode::Enter => {
                 let name = app.add_input.trim().to_string();
@@ -839,7 +833,7 @@ async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx
 
     if app.details_mode == DetailsMode::Add {
         match k.code {
-            KeyCode::Char(c)   => { if app.add_input.len() < 2048 { app.add_input.push(c); } }
+            KeyCode::Char(c)   => { app.add_input.push(c); }
             KeyCode::Backspace => { app.add_input.pop(); }
             KeyCode::Enter => {
                 let entry = app.add_input.trim().to_string();

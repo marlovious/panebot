@@ -54,12 +54,15 @@ pane_name = Standard
 
 const DEFAULT_HOSTS_CONF: &str = "\
 # pb.daemon.conf
+# mode = local    — bind to 127.0.0.1 only (default, safe)
+# mode = remote   — bind to 0.0.0.0, accepts LAN connections
+#
 # Add remote panebot nodes here.
-# The TUI connects to the listed host(s) at startup.
-# If empty, the TUI connects to localhost.
 #
 # [my-linux-box]
 # address = ws://192.168.1.x:9090
+
+mode = local
 ";
 
 // ---------------------------------------------------------------------------
@@ -132,7 +135,7 @@ impl Logger {
         let m     = (secs % 3600) / 60;
         let s     = secs % 60;
         let host: String = hostname().chars().take(10).collect();
-        let line  = format!("[{:02}:{:02}:{:02}] [{}] {}\n", h, m, s, host, msg);
+        let line  = format!("[{}] [{:02}:{:02}:{:02}] {}\n", host, h, m, s, msg);
         let _     = self.file.write_all(line.as_bytes());
         print!("{}", line);
     }
@@ -276,12 +279,15 @@ fn load_layout(name: &str, log: &mut Logger) -> Option<HashMap<String, LayoutEnt
 fn launch_pane(pane: &Pane, geometry: Option<&str>, log: &mut Logger) {
     let socket   = pane_socket(&pane.mpv_name);
     let mpv_conf = pane_mpv_conf(&pane.mpv_name);
-    let playlist = pane_playlist(&pane.mpv_name);
+    let playlist = pane.playlist.as_deref()
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| pane_playlist(&pane.mpv_name).to_string_lossy().to_string());
 
     let mut args: Vec<String> = vec![
         format!("--input-ipc-server={}", socket.to_string_lossy()),
         format!("--title={}", pane.pane_name.to_uppercase()),
         format!("--include={}", mpv_conf.to_string_lossy()),
+        format!("--playlist={}", playlist),
     ];
 
     #[cfg(target_os = "macos")]
@@ -292,18 +298,6 @@ fn launch_pane(pane: &Pane, geometry: Option<&str>, log: &mut Logger) {
 
     #[cfg(not(target_os = "macos"))]
     let _ = geometry;
-
-    if let Some(ref external) = pane.playlist {
-        if std::path::Path::new(external).exists() {
-            args.push(format!("--playlist={}", external));
-        } else {
-            args.push("--idle=yes".to_string());
-        }
-    } else if playlist.exists() && playlist.metadata().map(|m| m.len() > 0).unwrap_or(false) {
-        args.push(playlist.to_string_lossy().to_string());
-    } else {
-        args.push("--idle=yes".to_string());
-    }
 
     let mut cmd = std::process::Command::new("mpv");
     cmd.args(&args)
@@ -833,6 +827,16 @@ fn platform() -> &'static str {
     else                               { "unknown" }
 }
 
+// Returns the local LAN IP if available, otherwise 127.0.0.1.
+// Uses a UDP socket trick — no data is sent.
+fn local_ip() -> String {
+    use std::net::UdpSocket;
+    UdpSocket::bind("0.0.0.0:0")
+        .and_then(|s| { s.connect("8.8.8.8:80")?; s.local_addr() })
+        .map(|a| a.ip().to_string())
+        .unwrap_or_else(|_| "127.0.0.1".to_string())
+}
+
 // ---------------------------------------------------------------------------
 // Signal handling — handles SIGINT (Ctrl-C) and SIGTERM (systemd stop).
 // ---------------------------------------------------------------------------
@@ -853,6 +857,23 @@ async fn wait_for_signal() {
 }
 
 // ---------------------------------------------------------------------------
+// Daemon mode — read from pb.daemon.conf
+// ---------------------------------------------------------------------------
+
+fn load_daemon_mode() -> &'static str {
+    let content = std::fs::read_to_string(hosts_conf()).unwrap_or_default();
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(eq) = line.find('=') {
+            let key = line[..eq].trim();
+            let val = line[eq+1..].trim();
+            if key == "mode" && val == "remote" { return "remote"; }
+        }
+    }
+    "local"
+}
+
+// ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
 
@@ -868,6 +889,11 @@ async fn main() {
     let cfg = bootstrap(&mut log).expect("Bootstrap failed");
     log.log(&format!("config :: layout = {}", cfg.layout));
     log.log(&format!("config :: {} panes", cfg.panes.len()));
+
+    let daemon_mode = load_daemon_mode();
+    let bind_addr   = if daemon_mode == "remote" { "0.0.0.0:9090" } else { "127.0.0.1:9090" };
+    let display_ip  = if daemon_mode == "remote" { local_ip() } else { "127.0.0.1".to_string() };
+    log.log(&format!("mode :: {} :: {}", daemon_mode, display_ip));
 
     // Load layout first so geometry is available at launch time
     let layout_map = load_layout(&cfg.layout, &mut log);
@@ -906,6 +932,7 @@ async fn main() {
         "event":    "node:snapshot",
         "hostname": hostname(),
         "platform": platform(),
+        "ip":       display_ip,
         "layout":   cfg.layout,
         "home":     cfg.home,
         "panes":    cfg.panes.iter().map(|p| serde_json::json!({
@@ -918,7 +945,7 @@ async fn main() {
         })).collect::<Vec<_>>(),
     }).to_string();
 
-    log.log("panebot-daemon :: listening on ws://0.0.0.0:9090");
+    log.log(&format!("panebot-daemon :: listening on ws://{}", bind_addr));
 
     let current_layout = cfg.layout.clone();
     let panes:    SharedPanes  = Arc::new(cfg.panes);
@@ -937,7 +964,7 @@ async fn main() {
         });
     }
 
-    let listener = TcpListener::bind("0.0.0.0:9090").await
+    let listener = TcpListener::bind(bind_addr).await
         .expect("Failed to bind port 9090");
 
     let cleanup_panes = panes.clone();
