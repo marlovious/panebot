@@ -14,15 +14,16 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 
 use panebot_lib::{
     layouts_dir, home_dir, config_dir, load_hosts,
     DaemonEvent, PaneState, Host,
 };
 
-const LOCAL_ADDR:        &str = "ws://127.0.0.1:9090";
+const LOCAL_ADDR:        &str = "wss://127.0.0.1:9090";
 const CONNECT_RETRY_MS:  u64  = 500;
 const CONNECT_TIMEOUT_S: u64  = 30;
 
@@ -727,10 +728,61 @@ async fn cmd_mute_others(ws_tx: &mut WsSink, keep: &str, pane_order: &[String]) 
 }
 
 // ---------------------------------------------------------------------------
+// TLS — accept self-signed certs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct NoCertVerification;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer,
+        _intermediates: &[rustls::pki_types::CertificateDer],
+        _server_name: &rustls::pki_types::ServerName,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn make_tls_connector() -> Connector {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertVerification))
+        .with_no_client_auth();
+    Connector::Rustls(std::sync::Arc::new(config))
+}
+
+// ---------------------------------------------------------------------------
 // Spawn daemon
 // ---------------------------------------------------------------------------
 
 fn spawn_daemon() -> bool {
+    // On Linux, check if systemd service is available first
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "panebot-daemon"])
+            .output();
+        if let Ok(out) = status {
+            if out.status.success() { return false; } // service is running, don't spawn
+        }
+    }
+
     let Ok(exe) = std::env::current_exe() else { return false; };
     let Some(dir) = exe.parent() else { return false; };
     let daemon_path = dir.join("panebot-daemon");
@@ -746,8 +798,12 @@ fn spawn_daemon() -> bool {
 // ---------------------------------------------------------------------------
 
 async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, bool)> {
+    let connector = make_tls_connector();
+
     render_startup(terminal, &format!("Connecting to {}...", addr))?;
-    if let Ok((ws, _)) = connect_async(addr).await { return Ok((ws, false)); }
+    if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await {
+        return Ok((ws, false));
+    }
 
     if addr == LOCAL_ADDR {
         let spawned = spawn_daemon();
@@ -757,7 +813,7 @@ async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungst
             render_startup(terminal, msg)?;
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)) => {
-                    if let Ok((ws, _)) = connect_async(addr).await { return Ok((ws, spawned)); }
+                    if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await { return Ok((ws, spawned)); }
                 }
                 key = kevs.next() => {
                     if let Some(Ok(Event::Key(k))) = key {
@@ -773,7 +829,7 @@ async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungst
         let remaining = CONNECT_TIMEOUT_S.saturating_sub(attempt as u64 * CONNECT_RETRY_MS / 1000);
         render_startup(terminal, &format!("Waiting for {} ({}s)...", addr, remaining))?;
         tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
-        if let Ok((ws, _)) = connect_async(addr).await { return Ok((ws, false)); }
+        if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await { return Ok((ws, false)); }
     }
 
     Err(io::Error::new(io::ErrorKind::TimedOut, format!("Could not connect to {} after {}s", addr, CONNECT_TIMEOUT_S)))
@@ -1218,6 +1274,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

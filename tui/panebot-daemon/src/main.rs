@@ -9,10 +9,13 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::accept_async;
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::{SinkExt, StreamExt};
+use tokio_rustls::TlsAcceptor;
+use tokio_rustls::rustls::ServerConfig;
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 use panebot_lib::{
     load_config, load_hosts,
-    config_dir, layouts_dir, panes_conf, hosts_conf,
+    config_dir, layouts_dir, panes_conf, hosts_conf, cert_path, key_path,
     pane_dir, pane_mpv_conf, pane_playlist, pane_scripts, pane_socket,
     DaemonEvent, PaneInfo, PaneState, PlaylistItem, Pane,
 };
@@ -60,7 +63,7 @@ const DEFAULT_HOSTS_CONF: &str = "\
 # Add remote panebot nodes here.
 #
 # [my-linux-box]
-# address = ws://192.168.1.x:9090
+# address = wss://192.168.1.x:9090
 
 mode = local
 ";
@@ -208,7 +211,48 @@ fn bootstrap(log: &mut Logger) -> std::io::Result<panebot_lib::Config> {
         log.log("bootstrap :: config exists");
     }
 
+    // TLS cert — generate self-signed on first run
+    ensure_cert(log)?;
+
     Ok(cfg)
+}
+
+// ---------------------------------------------------------------------------
+// TLS — cert generation and acceptor
+// ---------------------------------------------------------------------------
+
+fn ensure_cert(log: &mut Logger) -> std::io::Result<()> {
+    let cert_p = cert_path();
+    let key_p  = key_path();
+    if cert_p.exists() && key_p.exists() { return Ok(()); }
+
+    log.log("bootstrap :: generating TLS certificate");
+    let cert = rcgen::generate_simple_self_signed(vec!["panebot".to_string(), "localhost".to_string()])
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    std::fs::write(&cert_p, cert.cert.pem())?;
+    std::fs::write(&key_p,  cert.key_pair.serialize_pem())?;
+    log.log("bootstrap :: TLS certificate written");
+    Ok(())
+}
+
+fn load_tls_acceptor() -> std::io::Result<TlsAcceptor> {
+    let cert_pem = std::fs::read(cert_path())?;
+    let key_pem  = std::fs::read(key_path())?;
+
+    let certs: Vec<CertificateDer> = rustls_pemfile::certs(&mut cert_pem.as_slice())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    let key = rustls_pemfile::private_key(&mut key_pem.as_slice())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, "no private key"))?;
+
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, PrivateKeyDer::from(key))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+
+    Ok(TlsAcceptor::from(Arc::new(config)))
 }
 
 // ---------------------------------------------------------------------------
@@ -497,7 +541,7 @@ async fn monitor_pane(
 // ---------------------------------------------------------------------------
 
 async fn handle_ws(
-    stream:   tokio::net::TcpStream,
+    stream:   tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
     state:    SharedState,
     tx:       broadcast::Sender<String>,
     snapshot: String,
@@ -643,11 +687,13 @@ fn write_panes_conf(panes: &[Pane]) {
 async fn broadcast_snapshot(panes: &SharedPanes, layout: &SharedLayout, tx: &broadcast::Sender<String>) {
     let known_hosts = load_hosts();
     let layout_name = layout.lock().unwrap().clone();
+    let daemon_mode = load_daemon_mode();
+    let ip = if daemon_mode == "remote" { local_ip() } else { "127.0.0.1".to_string() };
     let p = panes.read().await;
     let snapshot = serde_json::to_string(&DaemonEvent::NodeSnapshot {
         hostname:    hostname(),
         platform:    platform().to_string(),
-        ip:          "127.0.0.1".to_string(),
+        ip,
         layout:      layout_name,
         home:        panebot_lib::home_dir(),
         panes:       p.iter().map(|p| PaneInfo { name: p.mpv_name.clone(), pane_name: p.pane_name.clone() }).collect(),
@@ -952,6 +998,7 @@ fn load_daemon_mode() -> &'static str {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     std::fs::create_dir_all(config_dir()).expect("Failed to create config dir");
     let mut log = Logger::open().expect("Failed to open log file");
 
@@ -1032,7 +1079,9 @@ async fn main() {
     let listener = TcpListener::bind(bind_addr).await
         .expect("Failed to bind port 9090");
 
-    log.log(&format!("panebot-daemon :: listening on ws://{}", bind_addr));
+    let tls_acceptor = load_tls_acceptor().expect("Failed to load TLS acceptor");
+
+    log.log(&format!("panebot-daemon :: listening on wss://{}", bind_addr));
 
     let cleanup_panes = panes.clone();
     let do_cleanup = move |log: &mut Logger| {
@@ -1070,6 +1119,11 @@ async fn main() {
                     Ok(s)  => s,
                     Err(_) => continue,
                 };
+                let acceptor = tls_acceptor.clone();
+                let tls_stream = match acceptor.accept(stream).await {
+                    Ok(s)  => s,
+                    Err(_) => continue,
+                };
                 let s  = state.clone();
                 let t  = tx.clone();
                 let sn = node_snapshot.clone();
@@ -1078,7 +1132,7 @@ async fn main() {
                 let sd = shutdown.clone();
                 let la = layout.clone();
                 tokio::spawn(async move {
-                    handle_ws(stream, s, t, sn, c, p, sd, la).await;
+                    handle_ws(tls_stream, s, t, sn, c, p, sd, la).await;
                 });
             }
         }

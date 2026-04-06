@@ -14,14 +14,16 @@ use ratatui::{
 };
 use std::collections::{HashMap, HashSet};
 use std::io;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::Connector;
 
 use panebot_lib::{
-    layouts_dir, home_dir, config_dir, load_hosts, Host,
+    layouts_dir, home_dir, config_dir, load_hosts,
+    DaemonEvent, PaneState, Host,
 };
 
-const LOCAL_ADDR:        &str = "ws://127.0.0.1:9090";
+const LOCAL_ADDR:        &str = "wss://127.0.0.1:9090";
 const CONNECT_RETRY_MS:  u64  = 500;
 const CONNECT_TIMEOUT_S: u64  = 30;
 
@@ -33,6 +35,7 @@ const C_DIVIDER: Color = Color::Rgb(40, 58, 58);
 const C_RED:     Color = Color::Rgb(200, 60, 60);
 const C_GREEN:   Color = Color::Rgb(60, 180, 100);
 const C_WHITE:   Color = Color::Rgb(220, 220, 220);
+const C_MPV:     Color = Color::Rgb(80, 120, 180);   // steel blue — passthrough mode indicator
 
 type WsSink = futures_util::stream::SplitSink<
     tokio_tungstenite::WebSocketStream<
@@ -42,37 +45,15 @@ type WsSink = futures_util::stream::SplitSink<
 >;
 
 // ---------------------------------------------------------------------------
-// Pane state
+// PaneState display helpers — rendering only, not in lib
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
-struct PaneState {
-    mpv_name:     String,
-    pane_name:    String,
-    online:       bool,
-    idle_active:  Option<bool>,
-    paused:       Option<bool>,
-    muted:        Option<bool>,
-    volume:       Option<f64>,
-    title:        Option<String>,
-    playlist_pos: Option<i64>,
+trait PaneDisplay {
+    fn playback_label(&self) -> (&'static str, Color);
+    fn volume_label(&self) -> (String, Color);
 }
 
-impl PaneState {
-    fn new(mpv_name: &str, pane_name: &str) -> Self {
-        PaneState {
-            mpv_name:     mpv_name.to_string(),
-            pane_name:    pane_name.to_string(),
-            online:       false,
-            idle_active:  None,
-            paused:       None,
-            muted:        None,
-            volume:       None,
-            title:        None,
-            playlist_pos: None,
-        }
-    }
-
+impl PaneDisplay for PaneState {
     fn playback_label(&self) -> (&'static str, Color) {
         if !self.online                     { return ("Offline", C_RED);  }
         if self.idle_active.unwrap_or(true) { return ("Stopped", C_DIM);  }
@@ -98,24 +79,80 @@ impl PaneState {
 enum DetailsMode { Normal, Jump, Add, Save, Confirm }
 
 // ---------------------------------------------------------------------------
-// App state
+// Session state — network/node data, wiped clean on reconnect
 // ---------------------------------------------------------------------------
 
-struct App {
-    pane_order:       Vec<String>,
-    panes:            HashMap<String, PaneState>,
+struct SessionState {
+    pane_order:   Vec<String>,
+    panes:        HashMap<String, PaneState>,
+    hostname:     String,
+    platform:     String,
+    ip:           String,
+    layout:       String,
+    home:         String,
+    is_remote:    bool,
+    owns_daemon:  bool,
+    layouts:      Vec<String>,
+}
+
+impl SessionState {
+    fn new() -> Self {
+        SessionState {
+            pane_order:  Vec::new(),
+            panes:       HashMap::new(),
+            hostname:    String::new(),
+            platform:    String::new(),
+            ip:          String::new(),
+            layout:      String::new(),
+            home:        home_dir(),
+            is_remote:   false,
+            owns_daemon: false,
+            layouts:     Vec::new(),
+        }
+    }
+
+    fn active_count(&self) -> usize { self.panes.values().filter(|p| p.online).count() }
+
+    fn selected_name(&self, selected: usize) -> Option<String> {
+        self.pane_order.get(selected).cloned()
+    }
+
+    fn load_layouts(&mut self) {
+        let mut layouts = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(layouts_dir()) {
+            let mut names: Vec<_> = entries.filter_map(|e| e.ok()).filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name.ends_with(".layout") { Some(name.trim_end_matches(".layout").to_string()) } else { None }
+            }).collect();
+            names.sort();
+            layouts = names;
+        }
+        self.layouts = layouts;
+    }
+
+    fn apply_pane_state(&mut self, pane: &str, state: &PaneState) {
+        if let Some(ps) = self.panes.get_mut(pane) {
+            ps.online       = state.online;
+            ps.idle_active  = state.idle_active;
+            ps.paused       = state.paused;
+            ps.muted        = state.muted;
+            ps.volume       = state.volume;
+            ps.title        = state.title.clone();
+            ps.playlist_pos = state.playlist_pos;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UI state — survives reconnect
+// ---------------------------------------------------------------------------
+
+struct UiState {
     selected:         usize,
-    hostname:         String,
-    platform:         String,
-    layout:           String,
-    home:             String,
-    owns_daemon:      bool,
-    is_remote:        bool,
     show_log:         bool,
     command_mode:     bool,
     show_picker:      bool,
     picker_sel:       usize,
-    layouts:          Vec<String>,
     show_details:     bool,
     details_mode:     DetailsMode,
     playlist_sel:     usize,
@@ -127,23 +164,14 @@ struct App {
     passthrough_mode: bool,
 }
 
-impl App {
+impl UiState {
     fn new() -> Self {
-        App {
-            pane_order:       Vec::new(),
-            panes:            HashMap::new(),
+        UiState {
             selected:         0,
-            hostname:         String::new(),
-            platform:         String::new(),
-            layout:           String::new(),
-            home:             home_dir(),
-            owns_daemon:      false,
-            is_remote:        false,
             show_log:         false,
             command_mode:     false,
             show_picker:      false,
             picker_sel:       0,
-            layouts:          Vec::new(),
             show_details:     false,
             details_mode:     DetailsMode::Normal,
             playlist_sel:     0,
@@ -154,21 +182,6 @@ impl App {
             add_input:        String::new(),
             passthrough_mode: false,
         }
-    }
-
-    fn active_count(&self) -> usize { self.panes.values().filter(|p| p.online).count() }
-
-    fn selected_name(&self) -> Option<String> { self.pane_order.get(self.selected).cloned() }
-
-    fn select_next(&mut self) {
-        if !self.pane_order.is_empty() && self.selected + 1 < self.pane_order.len() { self.selected += 1; }
-    }
-    fn select_prev(&mut self) {
-        if !self.pane_order.is_empty() { self.selected = self.selected.saturating_sub(1); }
-    }
-
-    fn current_playlist_pos(&self) -> i64 {
-        self.selected_name().and_then(|n| self.panes.get(&n)).and_then(|p| p.playlist_pos).unwrap_or(-1)
     }
 
     fn open_details(&mut self) {
@@ -190,107 +203,121 @@ impl App {
 
     fn go_log(&mut self)    { self.show_log = true;  }
     fn leave_log(&mut self) { self.show_log = false; }
+}
 
-    fn load_layouts(&mut self) {
-        let mut layouts = Vec::new();
-        if let Ok(entries) = std::fs::read_dir(layouts_dir()) {
-            let mut names: Vec<_> = entries.filter_map(|e| e.ok()).filter_map(|e| {
-                let name = e.file_name().to_string_lossy().to_string();
-                if name.ends_with(".layout") { Some(name.trim_end_matches(".layout").to_string()) } else { None }
-            }).collect();
-            names.sort();
-            layouts = names;
+// ---------------------------------------------------------------------------
+// App — thin wrapper
+// ---------------------------------------------------------------------------
+
+struct App {
+    session: SessionState,
+    ui:      UiState,
+}
+
+impl App {
+    fn new() -> Self { App { session: SessionState::new(), ui: UiState::new() } }
+
+    fn selected_name(&self) -> Option<String> { self.session.selected_name(self.ui.selected) }
+
+    fn select_next(&mut self) {
+        if !self.session.pane_order.is_empty() && self.ui.selected + 1 < self.session.pane_order.len() {
+            self.ui.selected += 1;
         }
-        self.layouts = layouts;
+    }
+    fn select_prev(&mut self) {
+        if !self.session.pane_order.is_empty() { self.ui.selected = self.ui.selected.saturating_sub(1); }
+    }
+
+    fn current_playlist_pos(&self) -> i64 {
+        self.selected_name()
+            .and_then(|n| self.session.panes.get(&n))
+            .and_then(|p| p.playlist_pos)
+            .unwrap_or(-1)
     }
 }
 
 // ---------------------------------------------------------------------------
-// WS event processing
+// WS event processing — typed via DaemonEvent
 // ---------------------------------------------------------------------------
 
-fn process_event(app: &mut App, text: &str) -> Option<&'static str> {
-    let v: serde_json::Value = serde_json::from_str(text).ok()?;
-    let event = v["event"].as_str().unwrap_or("");
+// Returns true if node went down (caller should reconnect)
+fn process_event(app: &mut App, text: &str) -> bool {
+    let event: DaemonEvent = match serde_json::from_str(text) {
+        Ok(e)  => e,
+        Err(_) => return false,
+    };
 
     match event {
-        "node:snapshot" => {
-            app.hostname = v["hostname"].as_str().unwrap_or("").to_string();
-            app.platform = v["platform"].as_str().unwrap_or("").to_string();
-            app.layout   = v["layout"].as_str().unwrap_or("").to_string();
-            app.home     = v["home"].as_str().unwrap_or("").to_string();
-            app.load_layouts();
-            if let Some(panes) = v["panes"].as_array() {
-                for p in panes {
-                    let mpv_name  = p["name"].as_str().unwrap_or("").to_string();
-                    let pane_name = p["pane_name"].as_str().unwrap_or(mpv_name.as_str()).to_string();
-                    if !mpv_name.is_empty() {
-                        app.pane_order.push(mpv_name.clone());
-                        app.panes.insert(mpv_name.clone(), PaneState::new(&mpv_name, &pane_name));
-                    }
+        DaemonEvent::NodeSnapshot { hostname, platform, ip, layout, home, panes, .. } => {
+            app.session.hostname = hostname;
+            app.session.platform = platform;
+            app.session.ip       = ip;
+            app.session.layout   = layout;
+            app.session.home     = home;
+            app.session.load_layouts();
+            for p in panes {
+                if !p.name.is_empty() {
+                    app.session.pane_order.push(p.name.clone());
+                    app.session.panes.insert(p.name.clone(), PaneState::new(&p.name, &p.pane_name));
                 }
             }
         }
-        "online" => {
-            let pane = v["pane"].as_str().unwrap_or("");
-            if let Some(ps) = app.panes.get_mut(pane) {
+
+        DaemonEvent::Online { pane, state } => {
+            if let Some(ps) = app.session.panes.get_mut(&pane) {
                 ps.online = true;
-                if let Some(state) = v.get("state") { apply_state(ps, state); }
+                app.session.apply_pane_state(&pane, &state);
             }
         }
-        "offline" => {
-            let pane = v["pane"].as_str().unwrap_or("");
-            if let Some(ps) = app.panes.get_mut(pane) { ps.online = false; }
+
+        DaemonEvent::Offline { pane } => {
+            if let Some(ps) = app.session.panes.get_mut(&pane) { ps.online = false; }
         }
-        "property-change" => {
-            let pane = v["pane"].as_str().unwrap_or("");
-            let prop = v["property"].as_str().unwrap_or("");
-            if let Some(ps) = app.panes.get_mut(pane) {
-                match prop {
-                    "pause"        => { ps.paused       = v["value"].as_bool(); }
-                    "volume"       => { ps.volume       = v["value"].as_f64(); }
-                    "media-title"  => { ps.title        = v["value"].as_str().map(|s| s.to_string()); }
-                    "playlist-pos" => { ps.playlist_pos = v["value"].as_i64(); }
-                    "mute"         => { ps.muted        = v["value"].as_bool(); }
-                    "idle-active"  => { ps.idle_active  = v["value"].as_bool(); }
+
+        DaemonEvent::PropertyChange { pane, property, value } => {
+            if let Some(ps) = app.session.panes.get_mut(&pane) {
+                match property.as_str() {
+                    "pause"        => { ps.paused       = value.as_bool(); }
+                    "volume"       => { ps.volume       = value.as_f64(); }
+                    "media-title"  => { ps.title        = value.as_str().map(|s| s.to_string()); }
+                    "playlist-pos" => { ps.playlist_pos = value.as_i64(); }
+                    "mute"         => { ps.muted        = value.as_bool(); }
+                    "idle-active"  => { ps.idle_active  = value.as_bool(); }
                     _ => {}
                 }
             }
         }
-        "node:down" => { for ps in app.panes.values_mut() { ps.online = false; } return Some("node:down"); }
-        "node:layout" => { if let Some(l) = v["layout"].as_str() { app.layout = l.to_string(); } }
-        "node:playlist" => {
-            let pane = v["pane"].as_str().unwrap_or("");
-            if let Some(sel) = app.pane_order.iter().position(|n| n == pane) {
-                if sel == app.selected && app.show_details {
-                    if let Some(items) = v["items"].as_array() {
-                        app.playlist_items = items.iter().filter_map(|i| {
-                            let filename = i["filename"].as_str()?;
-                            Some(i["title"].as_str().filter(|t| !t.is_empty()).unwrap_or(filename).to_string())
-                        }).collect();
-                        app.playlist_sel = app.panes.get(pane).and_then(|p| p.playlist_pos)
-                            .filter(|&pos| pos >= 0).map(|pos| pos as usize).unwrap_or(0);
-                        app.status_msg = None;
-                    }
+
+        DaemonEvent::NodeDown => {
+            for ps in app.session.panes.values_mut() { ps.online = false; }
+            return true;
+        }
+
+        DaemonEvent::NodeLayout { layout } => { app.session.layout = layout; }
+
+        DaemonEvent::NodePlaylist { pane, items } => {
+            if let Some(sel) = app.session.pane_order.iter().position(|n| n == &pane) {
+                if sel == app.ui.selected && app.ui.show_details {
+                    app.ui.playlist_items = items.iter().map(|i| i.display().to_string()).collect();
+                    app.ui.playlist_sel = app.session.panes.get(&pane)
+                        .and_then(|p| p.playlist_pos)
+                        .filter(|&pos| pos >= 0)
+                        .map(|pos| pos as usize)
+                        .unwrap_or(0);
+                    app.ui.status_msg = None;
                 }
             }
         }
-        "node:playlist-saved" => {
-            let path = v["path"].as_str().unwrap_or("unknown");
-            app.status_msg = Some(format!("Saved to {}", path));
-        }
-        _ => {}
-    }
-    None
-}
 
-fn apply_state(ps: &mut PaneState, state: &serde_json::Value) {
-    if let Some(v) = state["paused"].as_bool()     { ps.paused       = Some(v); }
-    if let Some(v) = state["muted"].as_bool()       { ps.muted        = Some(v); }
-    if let Some(v) = state["idle_active"].as_bool() { ps.idle_active  = Some(v); }
-    if let Some(v) = state["volume"].as_f64()       { ps.volume       = Some(v); }
-    if let Some(v) = state["playlist_pos"].as_i64() { ps.playlist_pos = Some(v); }
-    if let Some(v) = state["title"].as_str()        { ps.title        = Some(v.to_string()); }
+        DaemonEvent::NodePlaylistSaved { path, .. } => {
+            app.ui.status_msg = Some(format!("Saved to {}", path));
+        }
+
+        // Informational — no UI action needed
+        DaemonEvent::NodeRestartPane { .. } | DaemonEvent::NodeRestartAll | DaemonEvent::NodeInfo { .. } => {}
+    }
+
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -320,6 +347,15 @@ fn fdim(s: &str) -> Span<'static> { Span::styled(s.to_string(), Style::default()
 
 fn hint(key: &str, label: &str) -> Vec<Span<'static>> {
     vec![sep_orange(), fdim(key), fdim(&format!(" {}", label))]
+}
+
+fn footer_mpv() -> Line<'static> {
+    Line::from(vec![
+        Span::styled("[MPV]", Style::default().fg(C_MPV).add_modifier(Modifier::BOLD)),
+        Span::styled(" passthrough — all keys forward to mpv  ", Style::default().fg(C_DIM)),
+        Span::styled("[v]", Style::default().fg(C_MPV)),
+        Span::styled(" exit", Style::default().fg(C_DIM)),
+    ])
 }
 
 fn footer_dashboard_normal() -> Line<'static> {
@@ -364,25 +400,21 @@ fn render_host_picker(terminal: &mut Term, hosts: &[Host], sel: usize) -> io::Re
     terminal.draw(|f| {
         let size   = f.size();
         let chunks = make_chunks(size);
-
         f.render_widget(Paragraph::new(Line::from(vec![
             Span::styled("[PaneBot]", Style::default().fg(C_ORANGE)), sep_dim(),
             Span::styled("Select node to connect", Style::default().fg(C_HINT)),
         ])), chunks[0]);
         f.render_widget(divider(size.width as usize), chunks[1]);
-
         let items: Vec<ListItem> = hosts.iter().enumerate().map(|(i, host)| {
             let is_sel = i == sel;
-            let cursor = if is_sel { Span::styled(">> ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") };
             let item = ListItem::new(Line::from(vec![
-                cursor,
+                if is_sel { Span::styled(">> ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") },
                 Span::styled(host.label.clone(), Style::default().fg(if is_sel { C_WHITE } else { C_HINT }).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
                 sep_dim(),
                 Span::styled(host.address.clone(), Style::default().fg(C_DIM)),
             ]));
             if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
         }).collect();
-
         f.render_widget(List::new(items), chunks[2]);
         f.render_widget(divider(size.width as usize), chunks[3]);
         f.render_widget(Paragraph::new(Line::from(vec![fdim("[j/k] Select"), sep_orange(), fdim("[Enter] Connect"), sep_orange(), fdim("[q] Quit")])), chunks[4]);
@@ -391,7 +423,7 @@ fn render_host_picker(terminal: &mut Term, hosts: &[Host], sel: usize) -> io::Re
 }
 
 // ---------------------------------------------------------------------------
-// Rendering — dashboard (+ log)
+// Rendering — dashboard
 // ---------------------------------------------------------------------------
 
 fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
@@ -401,33 +433,40 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
 
         f.render_widget(Paragraph::new(Line::from(vec![
             Span::styled("[PaneBot]", Style::default().fg(C_ORANGE)), sep_dim(),
-            Span::styled(format!("Active Panes: {}/{}", app.active_count(), app.pane_order.len()), Style::default().fg(C_HINT)),
+            Span::styled(format!("[{}]", app.session.hostname.chars().take(10).collect::<String>()), Style::default().fg(C_ORANGE)),
             sep_dim(),
-            Span::styled(format!("Layout: {}", app.layout), Style::default().fg(C_CYAN)),
+            Span::styled(app.session.ip.clone(), Style::default().fg(C_DIM)),
             sep_dim(),
-            Span::styled(format!("{} [{}]", app.hostname, app.platform), Style::default().fg(C_DIM)),
+            fdim("Panes:"),
+            Span::styled(format!(" {}/{}", app.session.active_count(), app.session.pane_order.len()), Style::default().fg(C_CYAN)),
+            sep_dim(),
+            fdim("Layout:"),
+            Span::styled(format!(" {}", app.session.layout), Style::default().fg(C_CYAN)),
         ])), chunks[0]);
         f.render_widget(divider(size.width as usize), chunks[1]);
 
-        if app.show_log {
-            render_log_body(f, chunks[2], app);
+        if app.ui.show_log {
+            render_log_body(f, chunks[2]);
         } else {
             render_pane_list(f, chunks[2], app);
-            if app.show_picker { render_layout_picker(f, chunks[2], app); }
+            if app.ui.show_picker { render_layout_picker(f, chunks[2], app); }
         }
 
         f.render_widget(divider(size.width as usize), chunks[3]);
-
-        let footer = if app.command_mode { footer_dashboard_cmd() } else { footer_dashboard_normal() };
-        let fw = if app.command_mode {
+        let footer = if app.ui.passthrough_mode { footer_mpv() }
+                     else if app.ui.command_mode { footer_dashboard_cmd() }
+                     else { footer_dashboard_normal() };
+        let fw = if app.ui.command_mode && !app.ui.passthrough_mode {
             Paragraph::new(footer).style(Style::default().bg(Color::Rgb(80, 40, 10)).fg(Color::Rgb(160, 100, 40)))
+        } else if app.ui.passthrough_mode {
+            Paragraph::new(footer).style(Style::default().bg(Color::Rgb(15, 20, 45)).fg(C_MPV))
         } else { Paragraph::new(footer) };
         f.render_widget(fw, chunks[4]);
     })?;
     Ok(())
 }
 
-fn render_log_body(f: &mut ratatui::Frame, area: Rect, _app: &App) {
+fn render_log_body(f: &mut ratatui::Frame, area: Rect) {
     let log_path  = config_dir().join("panebot-daemon.log");
     let log_lines: Vec<ListItem> = std::fs::read_to_string(&log_path)
         .unwrap_or_default().lines().map(|l| l.to_string()).collect::<Vec<_>>()
@@ -436,13 +475,13 @@ fn render_log_body(f: &mut ratatui::Frame, area: Rect, _app: &App) {
         .map(|line| {
             if let Some(rest) = line.strip_prefix('[') {
                 if let Some(mid) = rest.find("] [") {
-                    let ts   = &rest[..mid];
+                    let host = &rest[..mid];
                     let tail = &rest[mid + 3..];
                     if let Some(end) = tail.find(']') {
                         return ListItem::new(Line::from(vec![
-                            Span::styled(format!("[{}] ", ts),        Style::default().fg(C_DIM)),
-                            Span::styled(format!("[{}]", &tail[..end]), Style::default().fg(C_HINT)),
-                            Span::styled(tail[end + 1..].to_string(), Style::default().fg(C_DIM)),
+                            Span::styled(format!("[{}]", host),            Style::default().fg(C_ORANGE)),
+                            Span::styled(format!(" [{}]", &tail[..end]),  Style::default().fg(C_HINT)),
+                            Span::styled(tail[end + 1..].to_string(),      Style::default().fg(C_DIM)),
                         ]));
                     }
                 }
@@ -453,13 +492,11 @@ fn render_log_body(f: &mut ratatui::Frame, area: Rect, _app: &App) {
 }
 
 fn render_pane_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let max_name = app.panes.values().map(|p| p.pane_name.len() + 2).max().unwrap_or(8);
-
-    let items: Vec<ListItem> = app.pane_order.iter().enumerate().map(|(i, name)| {
-        let ps     = app.panes.get(name);
-        let is_sel = i == app.selected;
-
-        let cursor    = if is_sel { Span::styled(":: ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") };
+    let max_name = app.session.panes.values().map(|p| p.pane_name.len() + 2).max().unwrap_or(8);
+    let items: Vec<ListItem> = app.session.pane_order.iter().enumerate().map(|(i, name)| {
+        let ps     = app.session.panes.get(name);
+        let is_sel = i == app.ui.selected;
+        let cursor = if is_sel { Span::styled(":: ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") };
         let name_span = Span::styled(
             format!("{:<width$}", format!("\"{}\"", ps.map(|p| p.pane_name.to_uppercase()).unwrap_or_else(|| name.to_uppercase())), width = max_name),
             Style::default().fg(C_WHITE).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() }),
@@ -467,7 +504,21 @@ fn render_pane_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
         let (pb_label, pb_color) = ps.map(|p| p.playback_label()).unwrap_or(("Offline", C_RED));
         let (vol_str, vol_color) = ps.map(|p| p.volume_label()).unwrap_or_else(|| ("Offline".to_string(), C_RED));
         let title_str = ps.map(|p| p.title.as_deref().filter(|s| !s.is_empty()).unwrap_or("-").to_string()).unwrap_or_else(|| "-".to_string());
-        let cmd_badge = if is_sel && app.command_mode { Span::styled(" [CMD]", Style::default().fg(C_ORANGE)) } else { Span::raw("") };
+        let cmd_badge = if is_sel && app.ui.passthrough_mode {
+            Span::styled(" [MPV]", Style::default().fg(C_MPV))
+        } else if is_sel && app.ui.command_mode {
+            Span::styled(" [CMD]", Style::default().fg(C_ORANGE))
+        } else {
+            Span::raw("")
+        };
+
+        let row_bg = if is_sel && app.ui.passthrough_mode {
+            Color::Rgb(20, 30, 55)   // dark blue tint — MPV mode
+        } else if is_sel {
+            Color::Rgb(30, 58, 58)   // brighter teal — normal selection
+        } else {
+            Color::Reset
+        };
 
         let item = ListItem::new(Line::from(vec![
             cursor, name_span, sep_dim(),
@@ -475,24 +526,22 @@ fn render_pane_list(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled(format!("[{:8}]", vol_str),  Style::default().fg(vol_color)), sep_dim(),
             Span::styled(title_str, Style::default().fg(C_CYAN)), cmd_badge,
         ]));
-        if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
+        if is_sel { item.style(Style::default().bg(row_bg)) } else { item }
     }).collect();
-
     f.render_widget(List::new(items), area);
 }
 
 fn render_layout_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
-    let picker_items: Vec<ListItem> = app.layouts.iter().enumerate().map(|(i, name)| {
-        let is_sel = i == app.picker_sel;
+    let picker_items: Vec<ListItem> = app.session.layouts.iter().enumerate().map(|(i, name)| {
+        let is_sel = i == app.ui.picker_sel;
         let item = ListItem::new(Line::from(vec![
             Span::raw(if is_sel { ">> " } else { "   " }),
             Span::styled(name.clone(), Style::default().fg(if is_sel { C_CYAN } else { C_HINT }).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
-            if name == &app.layout { Span::styled(" *", Style::default().fg(C_ORANGE)) } else { Span::raw("") },
+            if name == &app.session.layout { Span::styled(" *", Style::default().fg(C_ORANGE)) } else { Span::raw("") },
         ]));
         if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
     }).collect();
-
-    let picker_area = Rect { x: area.x + 2, y: area.y, width: 30, height: (app.layouts.len() as u16 + 2).min(area.height) };
+    let picker_area = Rect { x: area.x + 2, y: area.y, width: 30, height: (app.session.layouts.len() as u16 + 2).min(area.height) };
     f.render_widget(ratatui::widgets::Clear, picker_area);
     f.render_widget(
         List::new(picker_items).block(ratatui::widgets::Block::default()
@@ -504,7 +553,7 @@ fn render_layout_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering — startup status
+// Rendering — startup
 // ---------------------------------------------------------------------------
 
 fn render_startup(terminal: &mut Term, status: &str) -> io::Result<()> {
@@ -518,12 +567,12 @@ fn render_startup(terminal: &mut Term, status: &str) -> io::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Rendering — details screen
+// Rendering — details
 // ---------------------------------------------------------------------------
 
 fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
-    let pane_name = match app.pane_order.get(app.selected) { Some(n) => n.clone(), None => return Ok(()) };
-    let ps          = app.panes.get(&pane_name);
+    let pane_name = match app.session.pane_order.get(app.ui.selected) { Some(n) => n.clone(), None => return Ok(()) };
+    let ps          = app.session.panes.get(&pane_name);
     let current_pos = app.current_playlist_pos();
 
     terminal.draw(|f| {
@@ -538,19 +587,19 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             sep_dim(),
             Span::styled(format!("[{:7}]", pb_label), Style::default().fg(pb_color)), sep_dim(),
             Span::styled(format!("[{:8}]", vol_str),  Style::default().fg(vol_color)), sep_dim(),
-            Span::styled(format!("{} items", app.playlist_items.len()), Style::default().fg(C_DIM)),
+            Span::styled(format!("{} items", app.ui.playlist_items.len()), Style::default().fg(C_DIM)),
         ])), chunks[0]);
         f.render_widget(divider(size.width as usize), chunks[1]);
 
         let list_height = chunks[2].height as usize;
-        let scroll_off  = if app.playlist_sel >= list_height { app.playlist_sel + 1 - list_height } else { 0 };
+        let scroll_off  = if app.ui.playlist_sel >= list_height { app.ui.playlist_sel + 1 - list_height } else { 0 };
 
-        let items: Vec<ListItem> = app.playlist_items.iter().enumerate()
+        let items: Vec<ListItem> = app.ui.playlist_items.iter().enumerate()
             .skip(scroll_off).take(list_height)
             .map(|(i, entry)| {
                 let is_current = i as i64 == current_pos;
-                let is_sel     = i == app.playlist_sel;
-                let is_marked  = app.selected_items.contains(&i);
+                let is_sel     = i == app.ui.playlist_sel;
+                let is_marked  = app.ui.selected_items.contains(&i);
                 let cursor     = if is_sel { Span::styled(">> ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") };
                 let marker     = if is_current { Span::styled("* ",  Style::default().fg(C_GREEN))  }
                                  else if is_marked  { Span::styled("• ", Style::default().fg(C_ORANGE)) }
@@ -569,10 +618,10 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
         f.render_widget(List::new(items), chunks[2]);
         f.render_widget(divider(size.width as usize), chunks[3]);
 
-        let footer = match &app.details_mode {
+        let footer = match &app.ui.details_mode {
             DetailsMode::Jump    => Line::from(vec![
                 Span::styled("Jump to #: ", Style::default().fg(C_HINT)),
-                Span::styled(app.jump_input.clone(), Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)),
+                Span::styled(app.ui.jump_input.clone(), Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)),
                 fdim("  [Enter] Go  [Esc] Cancel"),
             ]),
             DetailsMode::Confirm => Line::from(vec![
@@ -584,22 +633,23 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             ]),
             DetailsMode::Add     => Line::from(vec![
                 Span::styled("Add: ", Style::default().fg(C_HINT)),
-                Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
-                fdim("  [Enter] Add  [Esc] Cancel"),
+                Span::styled(app.ui.add_input.chars().rev().take(80).collect::<String>().chars().rev().collect::<String>(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
             ]),
             DetailsMode::Save    => Line::from(vec![
                 Span::styled("Save as: ", Style::default().fg(C_HINT)),
-                Span::styled(app.add_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
-                fdim(".m3u  [Enter] Save  [Esc] Cancel"),
+                Span::styled(app.ui.add_input.chars().rev().take(60).collect::<String>().chars().rev().collect::<String>(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                fdim(".m3u"),
             ]),
             DetailsMode::Normal  => {
-                if let Some(msg) = &app.status_msg {
+                if let Some(msg) = &app.ui.status_msg {
                     Line::from(Span::styled(msg.clone(), Style::default().fg(C_RED).add_modifier(Modifier::BOLD)))
-                } else if app.command_mode { footer_details_cmd() } else { footer_details_normal() }
+                } else if app.ui.command_mode { footer_details_cmd() } else { footer_details_normal() }
             }
         };
 
-        let fw = if app.command_mode {
+        let fw = if app.ui.passthrough_mode {
+            Paragraph::new(footer_mpv()).style(Style::default().bg(Color::Rgb(15, 20, 45)).fg(C_MPV))
+        } else if app.ui.command_mode {
             Paragraph::new(footer).style(Style::default().bg(Color::Rgb(80, 40, 10)).fg(Color::Rgb(160, 100, 40)))
         } else { Paragraph::new(footer) };
         f.render_widget(fw, chunks[4]);
@@ -622,9 +672,9 @@ fn mpv_key_name(code: KeyCode) -> &'static str {
         KeyCode::Up        => "UP",     KeyCode::Down      => "DOWN",   KeyCode::Left     => "LEFT",
         KeyCode::Right     => "RIGHT",  KeyCode::PageUp    => "PGUP",   KeyCode::PageDown => "PGDWN",
         KeyCode::Home      => "HOME",   KeyCode::End       => "END",
-        KeyCode::F(1)=>"F1", KeyCode::F(2)=>"F2", KeyCode::F(3)=>"F3",  KeyCode::F(4)=>"F4",
-        KeyCode::F(5)=>"F5", KeyCode::F(6)=>"F6", KeyCode::F(7)=>"F7",  KeyCode::F(8)=>"F8",
-        KeyCode::F(9)=>"F9", KeyCode::F(10)=>"F10",
+        KeyCode::F(1)=>"F1",  KeyCode::F(2)=>"F2",  KeyCode::F(3)=>"F3",  KeyCode::F(4)=>"F4",
+        KeyCode::F(5)=>"F5",  KeyCode::F(6)=>"F6",  KeyCode::F(7)=>"F7",  KeyCode::F(8)=>"F8",
+        KeyCode::F(9)=>"F9",  KeyCode::F(10)=>"F10",
         KeyCode::Char(c) => match c {
             'a'=>"a",'b'=>"b",'c'=>"c",'d'=>"d",'e'=>"e",'f'=>"f",'g'=>"g",'h'=>"h",
             'i'=>"i",'j'=>"j",'k'=>"k",'l'=>"l",'m'=>"m",'n'=>"n",'o'=>"o",'p'=>"p",
@@ -678,10 +728,61 @@ async fn cmd_mute_others(ws_tx: &mut WsSink, keep: &str, pane_order: &[String]) 
 }
 
 // ---------------------------------------------------------------------------
+// TLS — accept self-signed certs
+// ---------------------------------------------------------------------------
+
+#[derive(Debug)]
+struct NoCertVerification;
+
+impl rustls::client::danger::ServerCertVerifier for NoCertVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer,
+        _intermediates: &[rustls::pki_types::CertificateDer],
+        _server_name: &rustls::pki_types::ServerName,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(&self, _: &[u8], _: &rustls::pki_types::CertificateDer, _: &rustls::DigitallySignedStruct) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+fn make_tls_connector() -> Connector {
+    let config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(std::sync::Arc::new(NoCertVerification))
+        .with_no_client_auth();
+    Connector::Rustls(std::sync::Arc::new(config))
+}
+
+// ---------------------------------------------------------------------------
 // Spawn daemon
 // ---------------------------------------------------------------------------
 
 fn spawn_daemon() -> bool {
+    // On Linux, check if systemd service is available first
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::process::Command::new("systemctl")
+            .args(["--user", "is-active", "panebot-daemon"])
+            .output();
+        if let Ok(out) = status {
+            if out.status.success() { return false; } // service is running, don't spawn
+        }
+    }
+
     let Ok(exe) = std::env::current_exe() else { return false; };
     let Some(dir) = exe.parent() else { return false; };
     let daemon_path = dir.join("panebot-daemon");
@@ -697,18 +798,22 @@ fn spawn_daemon() -> bool {
 // ---------------------------------------------------------------------------
 
 async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, bool)> {
+    let connector = make_tls_connector();
+
     render_startup(terminal, &format!("Connecting to {}...", addr))?;
-    if let Ok((ws, _)) = connect_async(addr).await { return Ok((ws, false)); }
+    if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await {
+        return Ok((ws, false));
+    }
 
     if addr == LOCAL_ADDR {
-        let spawned    = spawn_daemon();
-        let mut kevs   = EventStream::new();
-        let msg        = if spawned { "Starting daemon... [q] to cancel" } else { "Waiting for daemon... [q] to cancel" };
+        let spawned = spawn_daemon();
+        let mut kevs = EventStream::new();
+        let msg = if spawned { "Starting daemon... [q] to cancel" } else { "Waiting for daemon... [q] to cancel" };
         loop {
             render_startup(terminal, msg)?;
             tokio::select! {
                 _ = tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)) => {
-                    if let Ok((ws, _)) = connect_async(addr).await { return Ok((ws, spawned)); }
+                    if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await { return Ok((ws, spawned)); }
                 }
                 key = kevs.next() => {
                     if let Some(Ok(Event::Key(k))) = key {
@@ -724,7 +829,7 @@ async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungst
         let remaining = CONNECT_TIMEOUT_S.saturating_sub(attempt as u64 * CONNECT_RETRY_MS / 1000);
         render_startup(terminal, &format!("Waiting for {} ({}s)...", addr, remaining))?;
         tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
-        if let Ok((ws, _)) = connect_async(addr).await { return Ok((ws, false)); }
+        if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await { return Ok((ws, false)); }
     }
 
     Err(io::Error::new(io::ErrorKind::TimedOut, format!("Could not connect to {} after {}s", addr, CONNECT_TIMEOUT_S)))
@@ -736,7 +841,7 @@ async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungst
 
 async fn resolve_daemon_addr(terminal: &mut Term) -> io::Result<Option<String>> {
     let mut hosts = load_hosts();
-    if hosts.is_empty() { return Ok(Some(LOCAL_ADDR.to_string())); }
+    // Always show picker — even single host, so user knows what they're connecting to
     hosts.insert(0, Host { label: "local".to_string(), address: LOCAL_ADDR.to_string() });
 
     let mut sel  = 0usize;
@@ -768,92 +873,91 @@ enum KeyAction { Quit, Render, RenderDetails, Reconnect, Nothing }
 
 async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut WsSink) -> io::Result<KeyAction> {
 
-    if app.details_mode == DetailsMode::Jump {
+    if app.ui.details_mode == DetailsMode::Jump {
         match k.code {
-            KeyCode::Char(c) if c.is_ascii_digit() => { app.jump_input.push(c); }
-            KeyCode::Backspace => { app.jump_input.pop(); }
+            KeyCode::Char(c) if c.is_ascii_digit() => { app.ui.jump_input.push(c); }
+            KeyCode::Backspace => { app.ui.jump_input.pop(); }
             KeyCode::Enter => {
-                if let Ok(idx) = app.jump_input.parse::<usize>() {
-                    app.playlist_sel = idx.min(app.playlist_items.len().saturating_sub(1));
+                if let Ok(idx) = app.ui.jump_input.parse::<usize>() {
+                    app.ui.playlist_sel = idx.min(app.ui.playlist_items.len().saturating_sub(1));
                 }
-                app.jump_input.clear(); app.details_mode = DetailsMode::Normal;
+                app.ui.jump_input.clear(); app.ui.details_mode = DetailsMode::Normal;
             }
-            KeyCode::Esc => { app.jump_input.clear(); app.details_mode = DetailsMode::Normal; }
+            KeyCode::Esc => { app.ui.jump_input.clear(); app.ui.details_mode = DetailsMode::Normal; }
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::RenderDetails);
     }
 
-    if app.details_mode == DetailsMode::Confirm {
+    if app.ui.details_mode == DetailsMode::Confirm {
         match k.code {
             KeyCode::Enter => {
                 if let Some(pane) = app.selected_name() {
-                    send_cmd(ws_tx, &pane, "playlist-play-index", serde_json::json!([app.playlist_sel])).await;
+                    send_cmd(ws_tx, &pane, "playlist-play-index", serde_json::json!([app.ui.playlist_sel])).await;
                     send_cmd(ws_tx, &pane, "set_property", serde_json::json!(["pause", false])).await;
                 }
-                app.details_mode = DetailsMode::Normal; app.status_msg = None;
+                app.ui.details_mode = DetailsMode::Normal; app.ui.status_msg = None;
             }
             KeyCode::Char('n') => {
                 if let Some(pane) = app.selected_name() {
                     let current_pos = app.current_playlist_pos();
-                    let insert_at = if current_pos >= 0 { (current_pos as usize + 1).min(app.playlist_items.len()) } else { 0 };
-                    let sel = app.playlist_sel;
+                    let insert_at = if current_pos >= 0 { (current_pos as usize + 1).min(app.ui.playlist_items.len()) } else { 0 };
+                    let sel = app.ui.playlist_sel;
                     if sel != insert_at && sel + 1 != insert_at {
                         send_cmd(ws_tx, &pane, "playlist-move", serde_json::json!([sel, insert_at])).await;
                         send_node_cmd(ws_tx, "panebot:playlist-get", serde_json::json!({"pane": pane})).await;
-                        app.status_msg = Some("Queued next".to_string());
+                        app.ui.status_msg = Some("Queued next".to_string());
                     }
                 }
-                app.details_mode = DetailsMode::Normal;
+                app.ui.details_mode = DetailsMode::Normal;
             }
-            KeyCode::Esc => { app.details_mode = DetailsMode::Normal; app.status_msg = None; }
+            KeyCode::Esc => { app.ui.details_mode = DetailsMode::Normal; app.ui.status_msg = None; }
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::RenderDetails);
     }
 
-    if app.details_mode == DetailsMode::Save {
+    if app.ui.details_mode == DetailsMode::Save {
         match k.code {
-            KeyCode::Char(c)   => { app.add_input.push(c); }
-            KeyCode::Backspace => { app.add_input.pop(); }
+            KeyCode::Char(c)   => { if app.ui.add_input.len() < 2048 { app.ui.add_input.push(c); } }
+            KeyCode::Backspace => { app.ui.add_input.pop(); }
             KeyCode::Enter => {
-                let name = app.add_input.trim().to_string();
+                let name = app.ui.add_input.trim().to_string();
                 if !name.is_empty() {
                     if let Some(pane) = app.selected_name() {
-                        send_node_cmd(ws_tx, "panebot:playlist-save", serde_json::json!({"pane": pane, "path": format!("{}/{}.m3u", app.home, name)})).await;
+                        send_node_cmd(ws_tx, "panebot:playlist-save", serde_json::json!({"pane": pane, "path": format!("{}/{}.m3u", app.session.home, name)})).await;
                     }
                 }
-                app.add_input.clear(); app.details_mode = DetailsMode::Normal;
+                app.ui.add_input.clear(); app.ui.details_mode = DetailsMode::Normal;
             }
-            KeyCode::Esc => { app.add_input.clear(); app.details_mode = DetailsMode::Normal; }
+            KeyCode::Esc => { app.ui.add_input.clear(); app.ui.details_mode = DetailsMode::Normal; }
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::RenderDetails);
     }
 
-    if app.details_mode == DetailsMode::Add {
+    if app.ui.details_mode == DetailsMode::Add {
         match k.code {
-            KeyCode::Char(c)   => { app.add_input.push(c); }
-            KeyCode::Backspace => { app.add_input.pop(); }
+            KeyCode::Char(c)   => { if app.ui.add_input.len() < 2048 { app.ui.add_input.push(c); } }
+            KeyCode::Backspace => { app.ui.add_input.pop(); }
             KeyCode::Enter => {
-                let entry = app.add_input.trim().to_string();
+                let entry = app.ui.add_input.trim().to_string();
                 if !entry.is_empty() {
                     if let Some(pane) = app.selected_name() {
-                        let expanded = if entry.starts_with('~') { entry.replacen('~', &app.home, 1) } else { entry };
+                        let expanded = if entry.starts_with('~') { entry.replacen('~', &app.session.home, 1) } else { entry };
                         send_cmd(ws_tx, &pane, "loadfile", serde_json::json!([expanded, "append"])).await;
                         send_node_cmd(ws_tx, "panebot:playlist-get", serde_json::json!({"pane": pane})).await;
                     }
                 }
-                app.add_input.clear(); app.details_mode = DetailsMode::Normal;
+                app.ui.add_input.clear(); app.ui.details_mode = DetailsMode::Normal;
             }
-            KeyCode::Esc => { app.add_input.clear(); app.details_mode = DetailsMode::Normal; }
+            KeyCode::Esc => { app.ui.add_input.clear(); app.ui.details_mode = DetailsMode::Normal; }
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::RenderDetails);
     }
 
-    // Command mode in details
-    if app.command_mode {
+    if app.ui.command_mode {
         if let Some(pane) = app.selected_name() {
             match k.code {
                 KeyCode::Char(' ')                  => { send_cmd(ws_tx, &pane, "cycle",    serde_json::json!(["pause"])).await; }
@@ -866,94 +970,90 @@ async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx
                 KeyCode::Down  | KeyCode::Char('j') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([-60, "relative"])).await; }
                 KeyCode::Char('0')                  => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume",  5])).await; }
                 KeyCode::Char('9')                  => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume", -5])).await; }
-                KeyCode::Char('v')                  => { app.passthrough_mode = true; }
-                KeyCode::Tab                        => { app.command_mode = false; app.status_msg = None; }
+                KeyCode::Char('v')                  => { app.ui.passthrough_mode = true; }
+                KeyCode::Tab                        => { app.ui.command_mode = false; app.ui.status_msg = None; }
                 _ => return Ok(KeyAction::Nothing),
             }
             return Ok(KeyAction::RenderDetails);
         }
     }
 
-    // Normal mode
-    if (k.code == KeyCode::Left || k.code == KeyCode::Char('h')) && !app.command_mode {
-        app.close_details();
-        return Ok(KeyAction::Render);
+    if (k.code == KeyCode::Left || k.code == KeyCode::Char('h')) && !app.ui.command_mode {
+        app.ui.close_details(); return Ok(KeyAction::Render);
     }
 
     match k.code {
-        KeyCode::Enter     => { app.details_mode = DetailsMode::Confirm; app.status_msg = None; }
-        KeyCode::Tab       => { app.command_mode = !app.command_mode; app.status_msg = None; }
-        KeyCode::Up    | KeyCode::Char('k') => { app.playlist_sel = app.playlist_sel.saturating_sub(1); app.status_msg = None; }
-        KeyCode::Down  | KeyCode::Char('j') => { if app.playlist_sel + 1 < app.playlist_items.len() { app.playlist_sel += 1; } app.status_msg = None; }
-        KeyCode::Char('J') => { app.playlist_sel = app.playlist_items.len().saturating_sub(1); app.status_msg = None; }
-        KeyCode::Char('K') => { app.playlist_sel = 0; app.status_msg = None; }
-        KeyCode::Char('[') => { app.playlist_sel = app.playlist_sel.saturating_sub(10); app.status_msg = None; }
-        KeyCode::Char(']') => { app.playlist_sel = (app.playlist_sel + 10).min(app.playlist_items.len().saturating_sub(1)); app.status_msg = None; }
+        KeyCode::Enter     => { app.ui.details_mode = DetailsMode::Confirm; app.ui.status_msg = None; }
+        KeyCode::Tab       => { app.ui.command_mode = !app.ui.command_mode; app.ui.status_msg = None; }
+        KeyCode::Up    | KeyCode::Char('k') => { app.ui.playlist_sel = app.ui.playlist_sel.saturating_sub(1); app.ui.status_msg = None; }
+        KeyCode::Down  | KeyCode::Char('j') => { if app.ui.playlist_sel + 1 < app.ui.playlist_items.len() { app.ui.playlist_sel += 1; } app.ui.status_msg = None; }
+        KeyCode::Char('J') => { app.ui.playlist_sel = app.ui.playlist_items.len().saturating_sub(1); app.ui.status_msg = None; }
+        KeyCode::Char('K') => { app.ui.playlist_sel = 0; app.ui.status_msg = None; }
+        KeyCode::Char('[') => { app.ui.playlist_sel = app.ui.playlist_sel.saturating_sub(10); app.ui.status_msg = None; }
+        KeyCode::Char(']') => { app.ui.playlist_sel = (app.ui.playlist_sel + 10).min(app.ui.playlist_items.len().saturating_sub(1)); app.ui.status_msg = None; }
         KeyCode::Char(' ') => {
-            let idx = app.playlist_sel;
-            if app.selected_items.contains(&idx) { app.selected_items.remove(&idx); } else { app.selected_items.insert(idx); }
-            if app.playlist_sel + 1 < app.playlist_items.len() { app.playlist_sel += 1; }
-            app.status_msg = None;
+            let idx = app.ui.playlist_sel;
+            if app.ui.selected_items.contains(&idx) { app.ui.selected_items.remove(&idx); } else { app.ui.selected_items.insert(idx); }
+            if app.ui.playlist_sel + 1 < app.ui.playlist_items.len() { app.ui.playlist_sel += 1; }
+            app.ui.status_msg = None;
         }
         KeyCode::Esc => {
-            if !app.selected_items.is_empty() { app.selected_items.clear(); app.status_msg = None; }
+            if !app.ui.selected_items.is_empty() { app.ui.selected_items.clear(); app.ui.status_msg = None; }
             else { return Ok(KeyAction::Nothing); }
         }
-        KeyCode::Char('G') => { app.details_mode = DetailsMode::Jump; app.jump_input.clear(); }
-        KeyCode::Char('A') => { app.details_mode = DetailsMode::Add;  app.add_input.clear();  app.status_msg = None; }
-        KeyCode::Char('S') => { app.details_mode = DetailsMode::Save; app.add_input.clear();  app.status_msg = None; }
+        KeyCode::Char('G') => { app.ui.details_mode = DetailsMode::Jump; app.ui.jump_input.clear(); }
+        KeyCode::Char('A') => { app.ui.details_mode = DetailsMode::Add;  app.ui.add_input.clear();  app.ui.status_msg = None; }
+        KeyCode::Char('S') => { app.ui.details_mode = DetailsMode::Save; app.ui.add_input.clear();  app.ui.status_msg = None; }
         KeyCode::Char('D') => {
             if let Some(pane) = app.selected_name() {
                 let current_pos = app.current_playlist_pos();
-                let targets: Vec<usize> = if app.selected_items.is_empty() { vec![app.playlist_sel] } else {
-                    let mut v: Vec<usize> = app.selected_items.iter().cloned().collect(); v.sort_unstable(); v
+                let targets: Vec<usize> = if app.ui.selected_items.is_empty() { vec![app.ui.playlist_sel] } else {
+                    let mut v: Vec<usize> = app.ui.selected_items.iter().cloned().collect(); v.sort_unstable(); v
                 };
                 if targets.iter().any(|&i| current_pos >= 0 && i as i64 == current_pos) {
-                    app.status_msg = Some("Cannot remove playing item".to_string());
+                    app.ui.status_msg = Some("Cannot remove playing item".to_string());
                 } else {
-                    for &idx in targets.iter().rev() {
-                        send_cmd(ws_tx, &pane, "playlist-remove", serde_json::json!([idx])).await;
-                    }
-                    app.selected_items.clear();
-                    app.playlist_sel = app.playlist_sel.min(app.playlist_items.len().saturating_sub(targets.len()).saturating_sub(1));
+                    for &idx in targets.iter().rev() { send_cmd(ws_tx, &pane, "playlist-remove", serde_json::json!([idx])).await; }
+                    app.ui.selected_items.clear();
+                    app.ui.playlist_sel = app.ui.playlist_sel.min(app.ui.playlist_items.len().saturating_sub(targets.len()).saturating_sub(1));
                     send_node_cmd(ws_tx, "panebot:playlist-get", serde_json::json!({"pane": pane})).await;
-                    app.status_msg = None;
+                    app.ui.status_msg = None;
                 }
             }
         }
         KeyCode::Char('M') => {
             if let Some(pane) = app.selected_name() {
-                if app.selected_items.is_empty() {
-                    app.status_msg = Some("Mark items with Space first".to_string());
+                if app.ui.selected_items.is_empty() {
+                    app.ui.status_msg = Some("Mark items with Space first".to_string());
                 } else {
-                    let dest = app.playlist_sel;
-                    let mut targets: Vec<usize> = app.selected_items.iter().cloned().collect(); targets.sort_unstable();
+                    let dest = app.ui.playlist_sel;
+                    let mut targets: Vec<usize> = app.ui.selected_items.iter().cloned().collect(); targets.sort_unstable();
                     let mut adj = dest;
                     for &idx in &targets {
                         send_cmd(ws_tx, &pane, "playlist-move", serde_json::json!([idx, adj])).await;
                         if idx < adj { adj = adj.saturating_sub(1); }
                     }
-                    app.selected_items.clear(); app.playlist_sel = dest;
+                    app.ui.selected_items.clear(); app.ui.playlist_sel = dest;
                     send_node_cmd(ws_tx, "panebot:playlist-get", serde_json::json!({"pane": pane})).await;
-                    app.status_msg = None;
+                    app.ui.status_msg = None;
                 }
             }
         }
         KeyCode::Char('C') => {
             if let Some(pane) = app.selected_name() {
-                let keep: Vec<usize> = if !app.selected_items.is_empty() {
-                    let mut v: Vec<usize> = app.selected_items.iter().cloned().collect(); v.sort_unstable(); v
+                let keep: Vec<usize> = if !app.ui.selected_items.is_empty() {
+                    let mut v: Vec<usize> = app.ui.selected_items.iter().cloned().collect(); v.sort_unstable(); v
                 } else {
                     let pos = app.current_playlist_pos();
-                    if pos < 0 { app.status_msg = Some("Nothing playing to crop around".to_string()); return Ok(KeyAction::RenderDetails); }
+                    if pos < 0 { app.ui.status_msg = Some("Nothing playing to crop around".to_string()); return Ok(KeyAction::RenderDetails); }
                     vec![pos as usize]
                 };
-                let mut to_remove: Vec<usize> = (0..app.playlist_items.len()).filter(|i| !keep.contains(i)).collect();
+                let mut to_remove: Vec<usize> = (0..app.ui.playlist_items.len()).filter(|i| !keep.contains(i)).collect();
                 to_remove.sort_unstable();
                 for &idx in to_remove.iter().rev() { send_cmd(ws_tx, &pane, "playlist-remove", serde_json::json!([idx])).await; }
-                app.selected_items.clear(); app.playlist_sel = 0;
+                app.ui.selected_items.clear(); app.ui.playlist_sel = 0;
                 send_node_cmd(ws_tx, "panebot:playlist-get", serde_json::json!({"pane": pane})).await;
-                app.status_msg = None;
+                app.ui.status_msg = None;
             }
         }
         _ => return Ok(KeyAction::Nothing),
@@ -967,37 +1067,37 @@ async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx
 
 async fn handle_dashboard_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut WsSink) -> io::Result<KeyAction> {
 
-    if app.show_picker {
+    if app.ui.show_picker {
         match k.code {
-            KeyCode::Char('j') | KeyCode::Down => { if app.picker_sel + 1 < app.layouts.len() { app.picker_sel += 1; } }
-            KeyCode::Char('k') | KeyCode::Up   => { app.picker_sel = app.picker_sel.saturating_sub(1); }
+            KeyCode::Char('j') | KeyCode::Down => { if app.ui.picker_sel + 1 < app.session.layouts.len() { app.ui.picker_sel += 1; } }
+            KeyCode::Char('k') | KeyCode::Up   => { app.ui.picker_sel = app.ui.picker_sel.saturating_sub(1); }
             KeyCode::Enter => {
-                if let Some(layout) = app.layouts.get(app.picker_sel).cloned() {
+                if let Some(layout) = app.session.layouts.get(app.ui.picker_sel).cloned() {
                     send_node_cmd(ws_tx, "panebot:layout", serde_json::json!({"layout_name": layout})).await;
-                    app.show_picker = false;
+                    app.ui.show_picker = false;
                 }
             }
-            KeyCode::Esc | KeyCode::Char('W') => { app.show_picker = false; }
+            KeyCode::Esc | KeyCode::Char('W') => { app.ui.show_picker = false; }
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::Render);
     }
 
-    if k.code == KeyCode::Char('W') && !app.is_remote {
-        app.picker_sel  = app.layouts.iter().position(|l| l == &app.layout).unwrap_or(0);
-        app.show_picker = true;
+    if k.code == KeyCode::Char('W') && !app.session.is_remote {
+        app.ui.picker_sel  = app.session.layouts.iter().position(|l| l == &app.session.layout).unwrap_or(0);
+        app.ui.show_picker = true;
         return Ok(KeyAction::Render);
     }
 
     if k.code == KeyCode::Char('C') { return Ok(KeyAction::Reconnect); }
 
-    if !app.command_mode && (k.code == KeyCode::Left || k.code == KeyCode::Char('h')) {
-        app.go_log(); return Ok(KeyAction::Render);
+    if !app.ui.command_mode && (k.code == KeyCode::Left || k.code == KeyCode::Char('h')) {
+        app.ui.go_log(); return Ok(KeyAction::Render);
     }
 
-    if !app.command_mode && (k.code == KeyCode::Right || k.code == KeyCode::Char('l')) {
+    if !app.ui.command_mode && (k.code == KeyCode::Right || k.code == KeyCode::Char('l')) {
         if app.selected_name().is_some() {
-            app.open_details();
+            app.ui.open_details();
             if let Some(pane) = app.selected_name() {
                 send_node_cmd(ws_tx, "panebot:playlist-get", serde_json::json!({"pane": pane})).await;
             }
@@ -1006,9 +1106,9 @@ async fn handle_dashboard_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_
         return Ok(KeyAction::Nothing);
     }
 
-    if k.code == KeyCode::Tab { app.command_mode = !app.command_mode; return Ok(KeyAction::Render); }
+    if k.code == KeyCode::Tab { app.ui.command_mode = !app.ui.command_mode; return Ok(KeyAction::Render); }
 
-    if !app.command_mode {
+    if !app.ui.command_mode {
         match k.code {
             KeyCode::Char('j') | KeyCode::Down => { app.select_next(); return Ok(KeyAction::Render); }
             KeyCode::Char('k') | KeyCode::Up   => { app.select_prev(); return Ok(KeyAction::Render); }
@@ -1018,22 +1118,23 @@ async fn handle_dashboard_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_
             }
             KeyCode::Char('R') => { send_node_cmd(ws_tx, "panebot:restart-all", serde_json::json!({})).await; return Ok(KeyAction::Render); }
             KeyCode::Char('S') => {
-                if let Some(pane) = app.selected_name() { let po = app.pane_order.clone(); cmd_solo(ws_tx, &pane, &po).await; }
+                if let Some(pane) = app.selected_name() { let po = app.session.pane_order.clone(); cmd_solo(ws_tx, &pane, &po).await; }
                 return Ok(KeyAction::Render);
             }
             KeyCode::Char('M') => {
-                if let Some(pane) = app.selected_name() { let po = app.pane_order.clone(); cmd_mute_others(ws_tx, &pane, &po).await; }
+                if let Some(pane) = app.selected_name() { let po = app.session.pane_order.clone(); cmd_mute_others(ws_tx, &pane, &po).await; }
                 return Ok(KeyAction::Render);
             }
             KeyCode::Char('P') => {
-                let po = app.pane_order.clone(); cmd_pause_toggle_all(ws_tx, &app.panes, &po).await;
+                let po = app.session.pane_order.clone();
+                cmd_pause_toggle_all(ws_tx, &app.session.panes, &po).await;
                 return Ok(KeyAction::Render);
             }
             _ => {}
         }
     }
 
-    if app.command_mode {
+    if app.ui.command_mode {
         if let Some(pane) = app.selected_name() {
             match k.code {
                 KeyCode::Char(' ')                  => { send_cmd(ws_tx, &pane, "cycle",    serde_json::json!(["pause"])).await; }
@@ -1046,7 +1147,7 @@ async fn handle_dashboard_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_
                 KeyCode::Down  | KeyCode::Char('j') => { send_cmd(ws_tx, &pane, "seek",     serde_json::json!([-60, "relative"])).await; }
                 KeyCode::Char('0')                  => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume",  5])).await; }
                 KeyCode::Char('9')                  => { send_cmd(ws_tx, &pane, "add",      serde_json::json!(["volume", -5])).await; }
-                KeyCode::Char('v')                  => { app.passthrough_mode = true; }
+                KeyCode::Char('v')                  => { app.ui.passthrough_mode = true; }
                 _ => return Ok(KeyAction::Nothing),
             }
             return Ok(KeyAction::Render);
@@ -1062,14 +1163,14 @@ async fn handle_dashboard_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_
 
 async fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut WsSink) -> io::Result<KeyAction> {
 
-    if k.code == KeyCode::Char('q') && !app.show_picker {
-        if app.show_details { app.close_details(); return Ok(KeyAction::Render); }
-        if app.show_log     { app.leave_log();     return Ok(KeyAction::Render); }
+    if k.code == KeyCode::Char('q') && !app.ui.show_picker {
+        if app.ui.show_details { app.ui.close_details(); return Ok(KeyAction::Render); }
+        if app.ui.show_log     { app.ui.leave_log();     return Ok(KeyAction::Render); }
         return Ok(KeyAction::Quit);
     }
 
-    if app.passthrough_mode {
-        if k.code == KeyCode::Char('v') { app.passthrough_mode = false; return Ok(KeyAction::Render); }
+    if app.ui.passthrough_mode {
+        if k.code == KeyCode::Char('v') { app.ui.passthrough_mode = false; return Ok(KeyAction::Render); }
         if let Some(pane) = app.selected_name() {
             let key_str = mpv_key_name(k.code);
             if !key_str.is_empty() { send_cmd(ws_tx, &pane, "keypress", serde_json::json!([key_str])).await; }
@@ -1077,15 +1178,15 @@ async fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut Ws
         return Ok(KeyAction::Nothing);
     }
 
-    if app.show_log && !app.show_details {
+    if app.ui.show_log && !app.ui.show_details {
         if k.code == KeyCode::Right || k.code == KeyCode::Char('l') ||
            k.code == KeyCode::Char('j') || k.code == KeyCode::Down {
-            app.leave_log(); return Ok(KeyAction::Render);
+            app.ui.leave_log(); return Ok(KeyAction::Render);
         }
         return Ok(KeyAction::Nothing);
     }
 
-    if app.show_details { return handle_details_keys(app, k, ws_tx).await; }
+    if app.ui.show_details { return handle_details_keys(app, k, ws_tx).await; }
 
     handle_dashboard_keys(app, k, ws_tx).await
 }
@@ -1103,12 +1204,21 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
 
         'reconnect: loop {
             let ws = match connect_ws(terminal, &addr).await {
-                Ok((ws, spawned)) => { if spawned { app.owns_daemon = true; } app.is_remote = addr != LOCAL_ADDR; ws }
+                Ok((ws, spawned)) => {
+                    if spawned { app.session.owns_daemon = true; }
+                    app.session.is_remote = addr != LOCAL_ADDR;
+                    ws
+                }
                 Err(e) if e.kind() == io::ErrorKind::Interrupted => break 'reconnect,
                 Err(_) => { tokio::time::sleep(std::time::Duration::from_millis(2000)).await; continue 'reconnect; }
             };
 
-            app.pane_order.clear(); app.panes.clear(); app.selected = 0;
+            // Clean session state on reconnect — UI state survives
+            app.session = SessionState::new();
+            app.session.is_remote = addr != LOCAL_ADDR;
+            // Close details if open — playlist belongs to old session
+            if app.ui.show_details { app.ui.close_details(); }
+
             let (mut ws_tx, mut ws_rx) = ws.split();
 
             loop {
@@ -1116,9 +1226,9 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                     msg = ws_rx.next() => {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
-                                let signal = process_event(&mut app, &text);
-                                if app.show_details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
-                                if signal == Some("node:down") {
+                                let node_down = process_event(&mut app, &text);
+                                if app.ui.show_details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
+                                if node_down {
                                     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                                     continue 'reconnect;
                                 }
@@ -1132,7 +1242,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                             Some(Ok(Event::Key(k))) => {
                                 match handle_key(&mut app, k, &mut ws_tx).await? {
                                     KeyAction::Quit => {
-                                        if app.owns_daemon {
+                                        if app.session.owns_daemon {
                                             send_node_cmd(&mut ws_tx, "panebot:shutdown", serde_json::json!({})).await;
                                             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                                         }
@@ -1141,7 +1251,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                     KeyAction::Reconnect     => break 'reconnect,
                                     KeyAction::Render        => render(terminal, &app)?,
                                     KeyAction::RenderDetails => {
-                                        if app.show_details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
+                                        if app.ui.show_details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
                                     }
                                     KeyAction::Nothing => {}
                                 }
@@ -1164,6 +1274,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    rustls::crypto::ring::default_provider().install_default().ok();
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;

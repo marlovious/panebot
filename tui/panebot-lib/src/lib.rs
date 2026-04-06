@@ -23,6 +23,9 @@ pub fn config_dir() -> PathBuf {
 pub fn layouts_dir()             -> PathBuf { config_dir().join("layouts") }
 pub fn panes_conf()              -> PathBuf { config_dir().join("pb.panes.conf") }
 pub fn hosts_conf()              -> PathBuf { config_dir().join("pb.daemon.conf") }
+pub fn cert_path()               -> PathBuf { config_dir().join("pb.crt") }
+pub fn key_path()                -> PathBuf { config_dir().join("pb.key") }
+pub fn hypr_rules_path()         -> PathBuf { config_dir().join("pb.hypr.conf") }
 pub fn pane_dir(n: &str)         -> PathBuf { config_dir().join(n.to_lowercase()) }
 pub fn pane_scripts(n: &str)     -> PathBuf { pane_dir(n).join("scripts") }
 pub fn pane_socket(n: &str)      -> PathBuf { pane_dir(n).join(format!("{}.sock",     n.to_lowercase())) }
