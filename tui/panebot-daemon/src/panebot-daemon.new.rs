@@ -693,47 +693,13 @@ async fn handle_node_command(
         "panebot:playlist-save" => {
             let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
             let save_path = match v["path"].as_str() { Some(p) => p.to_string(), None => return };
-
-            // Query mpv for current playlist via unix socket directly
-            let socket = pane_socket(&pane_name).to_string_lossy().to_string();
-            match UnixStream::connect(&socket).await {
-                Ok(mut stream) => {
-                    let cmd = serde_json::json!({"command":["get_property","playlist"]}).to_string() + "\n";
-                    if stream.write_all(cmd.as_bytes()).await.is_ok() {
-                        let mut reader = tokio::io::BufReader::new(stream);
-                        let mut response = String::new();
-                        if reader.read_line(&mut response).await.is_ok() {
-                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&response) {
-                                if v["error"] == "success" {
-                                    if let Some(items) = v["data"].as_array() {
-                                        let mut out = String::from("#EXTM3U\n");
-                                        for item in items {
-                                            if let Some(filename) = item["filename"].as_str() {
-                                                out.push_str(filename);
-                                                out.push('\n');
-                                            }
-                                        }
-                                        match std::fs::write(&save_path, &out) {
-                                            Ok(_) => {
-                                                let _ = tx.send(serde_json::to_string(&DaemonEvent::NodePlaylistSaved {
-                                                    pane: pane_name, path: save_path,
-                                                }).unwrap());
-                                            }
-                                            Err(e) => {
-                                                let mut log = Logger::open().unwrap();
-                                                log.log(&format!("playlist-save :: write failed: {}", e));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Err(e) => {
-                    let mut log = Logger::open().unwrap();
-                    log.log(&format!("playlist-save :: socket error: {}", e));
-                }
+            let sender    = cmds.lock().unwrap().get(&pane_name).cloned();
+            if let Some(s) = sender {
+                let cmd = serde_json::json!({"command": ["playlist-save", save_path.clone()]}).to_string();
+                let _ = s.send(cmd).await;
+                let _ = tx.send(serde_json::to_string(&DaemonEvent::NodePlaylistSaved {
+                    pane: pane_name, path: save_path,
+                }).unwrap());
             }
         }
 

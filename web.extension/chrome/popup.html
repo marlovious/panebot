@@ -28,10 +28,13 @@
     #url-bar {
       padding: 6px 10px;
       border-bottom: 1px solid #283a3a;
+      display: flex;
+      gap: 6px;
+      align-items: center;
     }
 
     #url-display {
-      width: 100%;
+      flex: 1;
       background: #0f1a1a;
       border: 1px solid #283a3a;
       color: #8ca0a0;
@@ -42,6 +45,20 @@
       overflow: hidden;
       text-overflow: ellipsis;
     }
+
+    #paste-btn {
+      padding: 4px 8px;
+      background: #0f1a1a;
+      border: 1px solid #283a3a;
+      color: #3ca0a0;
+      font-family: monospace;
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+
+    #paste-btn:hover { border-color: #3ca0a0; }
 
     #mode-bar {
       padding: 6px 10px;
@@ -62,15 +79,9 @@
       text-align: center;
     }
 
-    .mode-btn.active {
-      border-color: #e08030;
-      color: #e08030;
-    }
+    .mode-btn.active { border-color: #e08030; color: #e08030; }
 
-    #pane-list {
-      max-height: 280px;
-      overflow-y: auto;
-    }
+    #pane-list { max-height: 280px; overflow-y: auto; }
 
     .host-label {
       padding: 4px 10px;
@@ -145,11 +156,12 @@
 
   <div id="url-bar">
     <div id="url-display">...</div>
+    <button id="paste-btn">Paste</button>
   </div>
 
   <div id="mode-bar">
-    <button class="mode-btn active" data-mode="append-play" id="mode-append-play">Queue / Play</button>
-    <button class="mode-btn"        data-mode="replace"      id="mode-replace">Replace</button>
+    <button class="mode-btn active" data-mode="append-play">Queue / Play</button>
+    <button class="mode-btn"        data-mode="replace">Replace</button>
   </div>
 
   <div id="pane-list">

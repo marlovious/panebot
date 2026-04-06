@@ -1,39 +1,42 @@
 // ---------------------------------------------------------------------------
 // PaneBot Chrome Extension — popup.js
-//
-// Flow:
-//   1. Get current tab URL
-//   2. Connect to local daemon (ws://127.0.0.1:9090)
-//   3. Receive node:snapshot — get local panes + known_hosts
-//   4. Connect to each known_host, get their panes too
-//   5. Render pane list grouped by host
-//   6. User picks pane + mode, clicks Send
-//   7. Open WS to that host, send loadfile, close
 // ---------------------------------------------------------------------------
 
 const LOCAL_ADDR = 'ws://127.0.0.1:9090';
 
-let currentUrl    = '';
-let selectedPane  = null;  // { address, pane }
-let loadMode      = 'append-play';
-let allHosts      = [];    // [{ label, address, panes: [] }]
+let currentUrl   = '';
+let selectedPane = null;  // { address, pane }
+let loadMode     = 'append-play';
+let allHosts     = [];
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Check for a URL passed from the context menu right-click
+  // Check for URL passed from context menu
   const session = await chrome.storage.session.get('pendingUrl');
   if (session.pendingUrl) {
     currentUrl = session.pendingUrl;
     chrome.storage.session.remove('pendingUrl');
   } else {
-    // Fall back to current tab URL
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
     currentUrl = tab?.url || '';
   }
   document.getElementById('url-display').textContent = currentUrl;
+
+  // Paste button
+  document.getElementById('paste-btn').addEventListener('click', async () => {
+    try {
+      const text = await navigator.clipboard.readText();
+      if (text.trim()) {
+        currentUrl = text.trim();
+        document.getElementById('url-display').textContent = currentUrl;
+      }
+    } catch {
+      setStatus('Clipboard access denied', 'error');
+    }
+  });
 
   // Mode buttons
   document.querySelectorAll('.mode-btn').forEach(btn => {
@@ -44,81 +47,84 @@ document.addEventListener('DOMContentLoaded', async () => {
     });
   });
 
-  // Send button
   document.getElementById('send-btn').addEventListener('click', sendToPane);
 
-  // Connect to local daemon
-  connectToLocal();
+  connectAndLoad();
 });
 
 // ---------------------------------------------------------------------------
-// Connect to local daemon, get snapshot + known_hosts
+// Single connection — get snapshot + state, done
 // ---------------------------------------------------------------------------
 
-function connectToLocal() {
-  const ws = new WebSocket(LOCAL_ADDR);
+function connectAndLoad() {
+  const ws      = new WebSocket(LOCAL_ADDR);
+  let   settled = false;
 
-  ws.onopen = () => {};
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    ws.close();
+    renderPanes();
+  };
+
+  // Give the daemon 600ms to send everything then close
+  const timer = setTimeout(finish, 600);
 
   ws.onmessage = (evt) => {
     let msg;
     try { msg = JSON.parse(evt.data); } catch { return; }
 
     if (msg.event === 'node:snapshot') {
-      ws.close();
-
-      // Local host
       const localHost = {
         label:   msg.hostname || 'local',
         address: LOCAL_ADDR,
         panes:   (msg.panes || []).map(p => ({
           name:      p.name,
           pane_name: p.pane_name,
-          pane_type: p.pane_type,
           online:    false,
           paused:    null,
           idle:      null,
         })),
       };
-
       allHosts = [localHost];
 
-      // Render local panes immediately — don't wait for remotes
-      fetchLiveState(localHost, LOCAL_ADDR).then(() => renderPanes());
-      renderPanes();
-
-      // Fetch remote hosts progressively — each renders as it arrives
+      // Queue remote host fetches
       const knownHosts = msg.known_hosts || [];
-      knownHosts.forEach(h => {
-        fetchRemoteSnapshot(h.label, h.address).then(result => {
-          if (result) {
-            allHosts.push(result);
+      if (knownHosts.length > 0) {
+        Promise.all(knownHosts.map(h => fetchRemoteSnapshot(h.label, h.address)))
+          .then(results => {
+            results.forEach(r => { if (r) allHosts.push(r); });
             renderPanes();
-          }
-        });
-      });
+          });
+      }
     }
 
-    // Apply live state updates to local host
-    if (msg.event === 'online' || msg.event === 'offline' || msg.event === 'property-change') {
-      applyStateEvent(allHosts[0], msg);
+    if (msg.event === 'online') {
+      applyOnline(msg);
+      renderPanes();
+    }
+    if (msg.event === 'offline') {
+      applyOffline(msg);
       renderPanes();
     }
   };
 
+  ws.onopen  = () => {};
   ws.onerror = () => {
-    setStatus('Cannot connect to local daemon', 'error');
-    document.getElementById('connecting').textContent = 'Daemon not found at ' + LOCAL_ADDR;
+    clearTimeout(timer);
+    setStatus('Daemon not found at ' + LOCAL_ADDR, 'error');
+    document.getElementById('pane-list').innerHTML = '<div id="connecting">Daemon offline</div>';
   };
+  ws.onclose = () => clearTimeout(timer);
 }
 
 // ---------------------------------------------------------------------------
-// Fetch snapshot from a remote host
+// Remote snapshot — one connection, 500ms timeout
 // ---------------------------------------------------------------------------
 
 function fetchRemoteSnapshot(label, address) {
   return new Promise((resolve) => {
-    const ws = new WebSocket(address);
+    const ws      = new WebSocket(address);
     const timeout = setTimeout(() => { ws.close(); resolve(null); }, 500);
 
     ws.onmessage = (evt) => {
@@ -133,7 +139,6 @@ function fetchRemoteSnapshot(label, address) {
           panes:   (msg.panes || []).map(p => ({
             name:      p.name,
             pane_name: p.pane_name,
-            pane_type: p.pane_type,
             online:    false,
             paused:    null,
             idle:      null,
@@ -141,68 +146,35 @@ function fetchRemoteSnapshot(label, address) {
         });
       }
     };
-
     ws.onerror = () => { clearTimeout(timeout); resolve(null); };
   });
 }
 
 // ---------------------------------------------------------------------------
-// Fetch live pane state (online/offline/properties) for a host
+// State helpers
 // ---------------------------------------------------------------------------
 
-function fetchLiveState(host, address) {
-  return new Promise((resolve) => {
-    const ws = new WebSocket(address);
-    const timeout = setTimeout(() => { ws.close(); resolve(); }, 500);
-    let gotSnapshot = false;
-
-    ws.onmessage = (evt) => {
-      let msg;
-      try { msg = JSON.parse(evt.data); } catch { return; }
-
-      if (msg.event === 'node:snapshot') { gotSnapshot = true; return; }
-
-      if (gotSnapshot) {
-        applyStateEvent(host, msg);
-        // Once we've got a few state events, close
-        if (msg.event === 'online' || msg.event === 'offline') {
-          clearTimeout(timeout);
-          setTimeout(() => { ws.close(); resolve(); }, 300);
-        }
-      }
-    };
-
-    ws.onerror = () => { clearTimeout(timeout); resolve(); };
-  });
-}
-
-// ---------------------------------------------------------------------------
-// Apply state events to a host's pane list
-// ---------------------------------------------------------------------------
-
-function applyStateEvent(host, msg) {
+function applyOnline(msg) {
+  const host = allHosts.find(h => h.address === LOCAL_ADDR);
   if (!host) return;
   const pane = host.panes.find(p => p.name === msg.pane);
   if (!pane) return;
-
-  if (msg.event === 'online') {
-    pane.online = true;
-    if (msg.state) {
-      if (msg.state.paused      !== undefined) pane.paused = msg.state.paused;
-      if (msg.state.idle_active !== undefined) pane.idle   = msg.state.idle_active;
-    }
-  }
-  if (msg.event === 'offline') {
-    pane.online = false;
-  }
-  if (msg.event === 'property-change') {
-    if (msg.property === 'pause')       pane.paused = msg.value;
-    if (msg.property === 'idle-active') pane.idle   = msg.value;
+  pane.online = true;
+  if (msg.state) {
+    if (msg.state.paused      !== undefined) pane.paused = msg.state.paused;
+    if (msg.state.idle_active !== undefined) pane.idle   = msg.state.idle_active;
   }
 }
 
+function applyOffline(msg) {
+  const host = allHosts.find(h => h.address === LOCAL_ADDR);
+  if (!host) return;
+  const pane = host.panes.find(p => p.name === msg.pane);
+  if (pane) pane.online = false;
+}
+
 // ---------------------------------------------------------------------------
-// Render pane list
+// Render
 // ---------------------------------------------------------------------------
 
 function renderPanes() {
@@ -215,23 +187,19 @@ function renderPanes() {
   }
 
   allHosts.forEach(host => {
-    // Host label
     const hostEl = document.createElement('div');
     hostEl.className = 'host-label';
     hostEl.textContent = host.label + ' :: ' + host.address;
     list.appendChild(hostEl);
 
     host.panes.forEach(pane => {
-      const row = document.createElement('div');
+      const row    = document.createElement('div');
       row.className = 'pane-row';
+      if (selectedPane && selectedPane.address === host.address && selectedPane.pane === pane.name) {
+        row.classList.add('selected');
+      }
 
-      const isSelected = selectedPane &&
-        selectedPane.address === host.address &&
-        selectedPane.pane === pane.name;
-
-      if (isSelected) row.classList.add('selected');
-
-      const nameEl = document.createElement('span');
+      const nameEl   = document.createElement('span');
       nameEl.className = 'pane-name';
       nameEl.textContent = pane.pane_name || pane.name;
 
@@ -242,7 +210,6 @@ function renderPanes() {
 
       row.appendChild(nameEl);
       row.appendChild(statusEl);
-
       row.addEventListener('click', () => {
         selectedPane = { address: host.address, pane: pane.name };
         document.getElementById('send-btn').disabled = false;
@@ -250,7 +217,6 @@ function renderPanes() {
         row.classList.add('selected');
         setStatus('');
       });
-
       list.appendChild(row);
     });
   });
@@ -260,35 +226,30 @@ function renderPanes() {
 }
 
 function statusLabel(pane) {
-  if (!pane.online)              return { label: 'offline', cls: 'offline' };
-  if (pane.idle)                 return { label: 'stopped', cls: 'stopped' };
-  if (pane.paused)               return { label: 'paused',  cls: 'paused'  };
-  return                                { label: 'playing', cls: 'playing' };
+  if (!pane.online) return { label: 'offline', cls: 'offline' };
+  if (pane.idle)    return { label: 'stopped', cls: 'stopped' };
+  if (pane.paused)  return { label: 'paused',  cls: 'paused'  };
+  return                   { label: 'playing', cls: 'playing' };
 }
 
 // ---------------------------------------------------------------------------
-// Send loadfile to selected pane
+// Send
 // ---------------------------------------------------------------------------
 
 function sendToPane() {
   if (!selectedPane || !currentUrl) return;
 
   const ws = new WebSocket(selectedPane.address);
-
   ws.onopen = () => {
-    const cmd = JSON.stringify({
+    ws.send(JSON.stringify({
       command: 'loadfile',
       pane:    selectedPane.pane,
       args:    [currentUrl, loadMode],
-    });
-    ws.send(cmd);
+    }));
     setTimeout(() => ws.close(), 300);
     setStatus('Sent to ' + selectedPane.pane, 'ok');
   };
-
-  ws.onerror = () => {
-    setStatus('Failed to connect to ' + selectedPane.address, 'error');
-  };
+  ws.onerror = () => setStatus('Failed to connect to ' + selectedPane.address, 'error');
 }
 
 // ---------------------------------------------------------------------------
@@ -297,6 +258,6 @@ function sendToPane() {
 
 function setStatus(msg, cls) {
   const el = document.getElementById('status');
-  el.textContent  = msg;
-  el.className    = cls || '';
+  el.textContent = msg;
+  el.className   = cls || '';
 }
