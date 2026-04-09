@@ -28,7 +28,7 @@ const CONNECT_RETRY_MS:  u64  = 500;
 const CONNECT_TIMEOUT_S: u64  = 30;
 
 const C_ORANGE:  Color = Color::Rgb(224, 128, 48);
-const C_CYAN:    Color = Color::Rgb(60, 160, 160);
+const C_CYAN:    Color = Color::Rgb(50, 140, 140);
 const C_DIM:     Color = Color::Rgb(100, 120, 120);
 const C_HINT:    Color = Color::Rgb(140, 160, 160);
 const C_DIVIDER: Color = Color::Rgb(40, 58, 58);
@@ -76,7 +76,10 @@ impl PaneDisplay for PaneState {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq)]
-enum DetailsMode { Normal, Jump, Add, Save, Confirm }
+enum DetailsMode { Normal, Jump, Add, Save, Confirm, Search }
+
+#[derive(Debug, Clone, PartialEq)]
+enum Screen { Log, Dashboard, Details }
 
 // ---------------------------------------------------------------------------
 // Session state — network/node data, wiped clean on reconnect
@@ -149,18 +152,18 @@ impl SessionState {
 
 struct UiState {
     selected:         usize,
-    show_log:         bool,
+    screen:           Screen,
     command_mode:     bool,
     show_picker:      bool,
     picker_sel:       usize,
-    show_details:     bool,
     details_mode:     DetailsMode,
     playlist_sel:     usize,
     playlist_items:   Vec<String>,
     selected_items:   HashSet<usize>,
     status_msg:       Option<String>,
     jump_input:       String,
-    add_input:        String,
+    add_input:        String,  // used for both Add (URL) and Save (filename) modes
+    search_input:     String,
     passthrough_mode: bool,
 }
 
@@ -168,11 +171,10 @@ impl UiState {
     fn new() -> Self {
         UiState {
             selected:         0,
-            show_log:         false,
+            screen:           Screen::Dashboard,
             command_mode:     false,
             show_picker:      false,
             picker_sel:       0,
-            show_details:     false,
             details_mode:     DetailsMode::Normal,
             playlist_sel:     0,
             playlist_items:   Vec::new(),
@@ -180,6 +182,7 @@ impl UiState {
             status_msg:       None,
             jump_input:       String::new(),
             add_input:        String::new(),
+            search_input:     String::new(),
             passthrough_mode: false,
         }
     }
@@ -188,21 +191,22 @@ impl UiState {
         self.playlist_items.clear();
         self.playlist_sel   = 0;
         self.selected_items.clear();
-        self.show_details   = true;
+        self.screen         = Screen::Details;
         self.details_mode   = DetailsMode::Normal;
         self.status_msg     = Some("Loading playlist...".to_string());
     }
 
     fn close_details(&mut self) {
-        self.show_details = false;
+        self.screen       = Screen::Dashboard;
         self.details_mode = DetailsMode::Normal;
         self.status_msg   = None;
         self.jump_input.clear();
+        self.search_input.clear();
         self.selected_items.clear();
     }
 
-    fn go_log(&mut self)    { self.show_log = true;  }
-    fn leave_log(&mut self) { self.show_log = false; }
+    fn go_log(&mut self)    { self.screen = Screen::Log;       }
+    fn leave_log(&mut self) { self.screen = Screen::Dashboard; }
 }
 
 // ---------------------------------------------------------------------------
@@ -222,10 +226,14 @@ impl App {
     fn select_next(&mut self) {
         if !self.session.pane_order.is_empty() && self.ui.selected + 1 < self.session.pane_order.len() {
             self.ui.selected += 1;
+            self.ui.search_input.clear();
         }
     }
     fn select_prev(&mut self) {
-        if !self.session.pane_order.is_empty() { self.ui.selected = self.ui.selected.saturating_sub(1); }
+        if !self.session.pane_order.is_empty() {
+            self.ui.selected = self.ui.selected.saturating_sub(1);
+            self.ui.search_input.clear();
+        }
     }
 
     fn current_playlist_pos(&self) -> i64 {
@@ -255,6 +263,9 @@ fn process_event(app: &mut App, text: &str) -> bool {
             app.session.layout   = layout;
             app.session.home     = home;
             app.session.load_layouts();
+            // Clear before repopulating — prevents duplicates on reconnect
+            app.session.pane_order.clear();
+            app.session.panes.clear();
             for p in panes {
                 if !p.name.is_empty() {
                     app.session.pane_order.push(p.name.clone());
@@ -297,7 +308,7 @@ fn process_event(app: &mut App, text: &str) -> bool {
 
         DaemonEvent::NodePlaylist { pane, items } => {
             if let Some(sel) = app.session.pane_order.iter().position(|n| n == &pane) {
-                if sel == app.ui.selected && app.ui.show_details {
+                if sel == app.ui.selected && app.ui.screen == Screen::Details {
                     app.ui.playlist_items = items.iter().map(|i| i.display().to_string()).collect();
                     app.ui.playlist_sel = app.session.panes.get(&pane)
                         .and_then(|p| p.playlist_pos)
@@ -349,6 +360,10 @@ fn hint(key: &str, label: &str) -> Vec<Span<'static>> {
     vec![sep_orange(), fdim(key), fdim(&format!(" {}", label))]
 }
 
+fn footer_nav() -> Vec<Span<'static>> {
+    vec![fdim("Left:Right = Log <> Panes <> Details  ")]
+}
+
 fn footer_mpv() -> Line<'static> {
     Line::from(vec![
         Span::styled("[MPV]", Style::default().fg(C_MPV).add_modifier(Modifier::BOLD)),
@@ -359,8 +374,8 @@ fn footer_mpv() -> Line<'static> {
 }
 
 fn footer_dashboard_normal() -> Line<'static> {
-    let mut s = vec![fdim("[j/k]"), fdim(" Nav")];
-    for (k, l) in &[("[l/Rt]","Detail"),("[r/R]","Restart"),("[S]","Solo"),("[M]","Mute\u{2205}"),("[P]","Pause\u{2205}"),("[W]","Layout"),("[C]","Connect"),("[h/Lt]","Log"),("[q]","Quit")] {
+    let mut s = footer_nav();
+    for (k, l) in &[("[r/R]","Restart"),("[S]","Solo"),("[M]","Mute\u{2205}"),("[P]","Pause\u{2205}"),("[W]","Layout"),("[C]","Connect"),("[q]","Quit")] {
         s.extend(hint(k, l));
     }
     Line::from(s)
@@ -368,7 +383,7 @@ fn footer_dashboard_normal() -> Line<'static> {
 
 fn footer_dashboard_cmd() -> Line<'static> {
     let mut s = vec![Span::styled("[CMD]", Style::default().add_modifier(Modifier::BOLD)), sep_dim()];
-    for (k, l) in &[("[Space]","Pause"),("[m]","Mute"),("[Enter]","Next"),("[h/l]","\u{b1}5s"),("[j/k]","\u{b1}60s"),("[9/0]","Vol"),("[f]","Full"),("[v]","Adv"),("[Tab]","Close")] {
+    for (k, l) in &[("[Space]","Pause"),("[m]","Mute"),("[h/l]","\u{b1}5s"),("[j/k]","\u{b1}60s"),("[9/0]","Vol"),("[f]","Full"),("[v]","Adv"),("[Tab]","Close")] {
         s.push(Span::styled(k.to_string(), Style::default().add_modifier(Modifier::BOLD)));
         s.push(Span::styled(format!(" {} ", l), Style::default()));
     }
@@ -376,8 +391,8 @@ fn footer_dashboard_cmd() -> Line<'static> {
 }
 
 fn footer_details_normal() -> Line<'static> {
-    let mut s = vec![fdim("[j/k]"), fdim(" Nav")];
-    for (k, l) in &[("[Spc]","Mark"),("[Enter]","Play"),("[n]","Queue"),("[D]","Del"),("[M]","Move"),("[C]","Crop"),("[A]","Add"),("[S]","Save"),("[G]","Goto"),("[h/Lt]","Back")] {
+    let mut s = footer_nav();
+    for (k, l) in &[("[/]","Search"),("[Spc]","Mark"),("[Enter]","Play"),("[n]","Queue"),("[D]","Del"),("[M]","Move"),("[C]","Crop"),("[A]","Add"),("[S]","Save"),("[G]","Goto"),("[q]","Back")] {
         s.extend(hint(k, l));
     }
     Line::from(s)
@@ -385,7 +400,7 @@ fn footer_details_normal() -> Line<'static> {
 
 fn footer_details_cmd() -> Line<'static> {
     let mut s = vec![Span::styled("[CMD]", Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD)), sep_orange()];
-    for (k, l) in &[("[Space]","Pause"),("[m]","Mute"),("[Enter]","Next"),("[h/l]","\u{b1}5s"),("[j/k]","\u{b1}60s"),("[9/0]","Vol"),("[Tab]","Close")] {
+    for (k, l) in &[("[Space]","Pause"),("[m]","Mute"),("[h/l]","\u{b1}5s"),("[j/k]","\u{b1}60s"),("[9/0]","Vol"),("[Tab]","Close")] {
         s.push(fdim(k)); s.push(fdim(&format!(" {}", l))); s.push(sep_orange());
     }
     s.pop();
@@ -413,7 +428,7 @@ fn render_host_picker(terminal: &mut Term, hosts: &[Host], sel: usize) -> io::Re
                 sep_dim(),
                 Span::styled(host.address.clone(), Style::default().fg(C_DIM)),
             ]));
-            if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
+            if is_sel { item.style(Style::default().bg(Color::Rgb(30, 58, 58))) } else { item }
         }).collect();
         f.render_widget(List::new(items), chunks[2]);
         f.render_widget(divider(size.width as usize), chunks[3]);
@@ -445,7 +460,7 @@ fn render(terminal: &mut Term, app: &App) -> io::Result<()> {
         ])), chunks[0]);
         f.render_widget(divider(size.width as usize), chunks[1]);
 
-        if app.ui.show_log {
+        if app.ui.screen == Screen::Log {
             render_log_body(f, chunks[2]);
         } else {
             render_pane_list(f, chunks[2], app);
@@ -539,7 +554,7 @@ fn render_layout_picker(f: &mut ratatui::Frame, area: Rect, app: &App) {
             Span::styled(name.clone(), Style::default().fg(if is_sel { C_CYAN } else { C_HINT }).add_modifier(if is_sel { Modifier::BOLD } else { Modifier::empty() })),
             if name == &app.session.layout { Span::styled(" *", Style::default().fg(C_ORANGE)) } else { Span::raw("") },
         ]));
-        if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
+        if is_sel { item.style(Style::default().bg(Color::Rgb(30, 58, 58))) } else { item }
     }).collect();
     let picker_area = Rect { x: area.x + 2, y: area.y, width: 30, height: (app.session.layouts.len() as u16 + 2).min(area.height) };
     f.render_widget(ratatui::widgets::Clear, picker_area);
@@ -587,32 +602,42 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
             sep_dim(),
             Span::styled(format!("[{:7}]", pb_label), Style::default().fg(pb_color)), sep_dim(),
             Span::styled(format!("[{:8}]", vol_str),  Style::default().fg(vol_color)), sep_dim(),
-            Span::styled(format!("{} items", app.ui.playlist_items.len()), Style::default().fg(C_DIM)),
+            {
+                let title = ps.and_then(|p| p.title.as_deref()).filter(|t| !t.is_empty());
+                if let Some(t) = title {
+                    Span::styled(t.to_string(), Style::default().fg(C_CYAN))
+                } else {
+                    Span::styled(format!("{} items", app.ui.playlist_items.len()), Style::default().fg(C_DIM))
+                }
+            },
         ])), chunks[0]);
         f.render_widget(divider(size.width as usize), chunks[1]);
 
         let list_height = chunks[2].height as usize;
-        let scroll_off  = if app.ui.playlist_sel >= list_height { app.ui.playlist_sel + 1 - list_height } else { 0 };
+        let half       = list_height / 2;
+        let scroll_off = app.ui.playlist_sel.saturating_sub(half).min(app.ui.playlist_items.len().saturating_sub(list_height));
 
+        let search_q = app.ui.search_input.to_lowercase();
         let items: Vec<ListItem> = app.ui.playlist_items.iter().enumerate()
             .skip(scroll_off).take(list_height)
             .map(|(i, entry)| {
                 let is_current = i as i64 == current_pos;
                 let is_sel     = i == app.ui.playlist_sel;
                 let is_marked  = app.ui.selected_items.contains(&i);
+                let is_match   = !search_q.is_empty() && entry.to_lowercase().contains(&search_q);
                 let cursor     = if is_sel { Span::styled(">> ", Style::default().fg(C_ORANGE)) } else { Span::raw("   ") };
                 let marker     = if is_current { Span::styled("* ",  Style::default().fg(C_GREEN))  }
                                  else if is_marked  { Span::styled("• ", Style::default().fg(C_ORANGE)) }
                                  else { Span::raw("  ") };
                 let idx_color  = if is_current || is_marked { C_ORANGE } else { C_DIM };
-                let txt_color  = if is_current { C_CYAN } else if is_marked { C_WHITE } else { C_HINT };
+                let txt_color  = if is_match { C_WHITE } else if is_current { C_CYAN } else if is_marked { C_WHITE } else { C_HINT };
                 let item = ListItem::new(Line::from(vec![
                     cursor, marker,
                     Span::styled(format!("{:<4}", i), Style::default().fg(idx_color)),
                     Span::styled(" :: ", Style::default().fg(C_DIM)),
                     Span::styled(entry.clone(), Style::default().fg(txt_color)),
                 ]));
-                if is_sel { item.style(Style::default().bg(Color::Rgb(20, 40, 40))) } else { item }
+                if is_sel { item.style(Style::default().bg(Color::Rgb(30, 58, 58))) } else { item }
             }).collect();
 
         f.render_widget(List::new(items), chunks[2]);
@@ -629,7 +654,12 @@ fn render_details(terminal: &mut Term, app: &App) -> io::Result<()> {
                 Span::styled("  ::  ", Style::default().fg(C_ORANGE)),
                 Span::styled("Queue Next [n]", Style::default().fg(C_CYAN).add_modifier(Modifier::BOLD)),
                 Span::styled("  ::  ", Style::default().fg(C_ORANGE)),
-                fdim("Cancel [Esc]"),
+                fdim("Cancel [h/Esc]"),
+            ]),
+            DetailsMode::Search  => Line::from(vec![
+                Span::styled("/", Style::default().fg(C_ORANGE).add_modifier(Modifier::BOLD)),
+                Span::styled(app.ui.search_input.clone(), Style::default().fg(C_WHITE).add_modifier(Modifier::BOLD)),
+                fdim("  [Enter] Jump to match  [Esc] Clear"),
             ]),
             DetailsMode::Add     => Line::from(vec![
                 Span::styled("Add: ", Style::default().fg(C_HINT)),
@@ -702,8 +732,9 @@ async fn send_node_cmd(ws_tx: &mut WsSink, cmd: &str, params: serde_json::Value)
 async fn cmd_pause_toggle_all(ws_tx: &mut WsSink, panes: &HashMap<String, PaneState>, pane_order: &[String]) {
     let any_playing = panes.values().any(|p| p.online && !p.idle_active.unwrap_or(true) && !p.paused.unwrap_or(true));
     for pane in pane_order {
-        if any_playing { send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", true])).await; }
-        else {
+        if any_playing {
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", true])).await;
+        } else {
             send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute",  true])).await;
             send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", false])).await;
         }
@@ -713,8 +744,9 @@ async fn cmd_pause_toggle_all(ws_tx: &mut WsSink, panes: &HashMap<String, PaneSt
 async fn cmd_solo(ws_tx: &mut WsSink, solo: &str, pane_order: &[String]) {
     for pane in pane_order {
         if pane == solo {
-            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute",  false])).await;
-            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause", false])).await;
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute",       false])).await;
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["pause",      false])).await;
+            send_cmd(ws_tx, pane, "set_property", serde_json::json!(["fullscreen", true ])).await;
         } else {
             send_cmd(ws_tx, pane, "set_property", serde_json::json!(["mute", true])).await;
         }
@@ -825,11 +857,20 @@ async fn connect_ws(terminal: &mut Term, addr: &str) -> io::Result<(tokio_tungst
     }
 
     let retries = (CONNECT_TIMEOUT_S * 1000 / CONNECT_RETRY_MS) as u32;
+    let mut kevs = EventStream::new();
     for attempt in 0..retries {
         let remaining = CONNECT_TIMEOUT_S.saturating_sub(attempt as u64 * CONNECT_RETRY_MS / 1000);
-        render_startup(terminal, &format!("Waiting for {} ({}s)...", addr, remaining))?;
-        tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)).await;
-        if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await { return Ok((ws, false)); }
+        render_startup(terminal, &format!("Waiting for {} ({}s)... [q] to cancel", addr, remaining))?;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(CONNECT_RETRY_MS)) => {
+                if let Ok((ws, _)) = connect_async_tls_with_config(addr, None, false, Some(connector.clone())).await { return Ok((ws, false)); }
+            }
+            key = kevs.next() => {
+                if let Some(Ok(Event::Key(k))) = key {
+                    if k.code == KeyCode::Char('q') { return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled")); }
+                }
+            }
+        }
     }
 
     Err(io::Error::new(io::ErrorKind::TimedOut, format!("Could not connect to {} after {}s", addr, CONNECT_TIMEOUT_S)))
@@ -873,6 +914,38 @@ enum KeyAction { Quit, Render, RenderDetails, Reconnect, Nothing }
 
 async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut WsSink) -> io::Result<KeyAction> {
 
+    if app.ui.details_mode == DetailsMode::Search {
+        match k.code {
+            KeyCode::Char(c) => {
+                app.ui.search_input.push(c);
+                // Jump to first match as user types
+                let q = app.ui.search_input.to_lowercase();
+                if let Some(idx) = app.ui.playlist_items.iter().position(|i| i.to_lowercase().contains(&q)) {
+                    app.ui.playlist_sel = idx;
+                }
+            }
+            KeyCode::Backspace => {
+                app.ui.search_input.pop();
+                let q = app.ui.search_input.to_lowercase();
+                if !q.is_empty() {
+                    if let Some(idx) = app.ui.playlist_items.iter().position(|i| i.to_lowercase().contains(&q)) {
+                        app.ui.playlist_sel = idx;
+                    }
+                }
+            }
+            KeyCode::Enter => {
+                // Stay on current match, exit search
+                app.ui.details_mode = DetailsMode::Normal;
+            }
+            KeyCode::Esc => {
+                app.ui.search_input.clear();
+                app.ui.details_mode = DetailsMode::Normal;
+            }
+            _ => {}
+        }
+        return Ok(KeyAction::RenderDetails);
+    }
+
     if app.ui.details_mode == DetailsMode::Jump {
         match k.code {
             KeyCode::Char(c) if c.is_ascii_digit() => { app.ui.jump_input.push(c); }
@@ -911,7 +984,7 @@ async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx
                 }
                 app.ui.details_mode = DetailsMode::Normal;
             }
-            KeyCode::Esc => { app.ui.details_mode = DetailsMode::Normal; app.ui.status_msg = None; }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => { app.ui.details_mode = DetailsMode::Normal; app.ui.status_msg = None; }
             _ => return Ok(KeyAction::Nothing),
         }
         return Ok(KeyAction::RenderDetails);
@@ -1001,9 +1074,10 @@ async fn handle_details_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_tx
             if !app.ui.selected_items.is_empty() { app.ui.selected_items.clear(); app.ui.status_msg = None; }
             else { return Ok(KeyAction::Nothing); }
         }
-        KeyCode::Char('G') => { app.ui.details_mode = DetailsMode::Jump; app.ui.jump_input.clear(); }
-        KeyCode::Char('A') => { app.ui.details_mode = DetailsMode::Add;  app.ui.add_input.clear();  app.ui.status_msg = None; }
-        KeyCode::Char('S') => { app.ui.details_mode = DetailsMode::Save; app.ui.add_input.clear();  app.ui.status_msg = None; }
+        KeyCode::Char('G') => { app.ui.details_mode = DetailsMode::Jump;   app.ui.jump_input.clear();   }
+        KeyCode::Char('/') => { app.ui.details_mode = DetailsMode::Search; app.ui.search_input.clear(); }
+        KeyCode::Char('A') => { app.ui.details_mode = DetailsMode::Add;    app.ui.add_input.clear();    app.ui.status_msg = None; }
+        KeyCode::Char('S') => { app.ui.details_mode = DetailsMode::Save;   app.ui.add_input.clear();    app.ui.status_msg = None; }
         KeyCode::Char('D') => {
             if let Some(pane) = app.selected_name() {
                 let current_pos = app.current_playlist_pos();
@@ -1164,8 +1238,8 @@ async fn handle_dashboard_keys(app: &mut App, k: crossterm::event::KeyEvent, ws_
 async fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut WsSink) -> io::Result<KeyAction> {
 
     if k.code == KeyCode::Char('q') && !app.ui.show_picker {
-        if app.ui.show_details { app.ui.close_details(); return Ok(KeyAction::Render); }
-        if app.ui.show_log     { app.ui.leave_log();     return Ok(KeyAction::Render); }
+        if app.ui.screen == Screen::Details { app.ui.close_details(); return Ok(KeyAction::Render); }
+        if app.ui.screen == Screen::Log     { app.ui.leave_log();     return Ok(KeyAction::Render); }
         return Ok(KeyAction::Quit);
     }
 
@@ -1178,7 +1252,7 @@ async fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut Ws
         return Ok(KeyAction::Nothing);
     }
 
-    if app.ui.show_log && !app.ui.show_details {
+    if app.ui.screen == Screen::Log {
         if k.code == KeyCode::Right || k.code == KeyCode::Char('l') ||
            k.code == KeyCode::Char('j') || k.code == KeyCode::Down {
             app.ui.leave_log(); return Ok(KeyAction::Render);
@@ -1186,7 +1260,7 @@ async fn handle_key(app: &mut App, k: crossterm::event::KeyEvent, ws_tx: &mut Ws
         return Ok(KeyAction::Nothing);
     }
 
-    if app.ui.show_details { return handle_details_keys(app, k, ws_tx).await; }
+    if app.ui.screen == Screen::Details { return handle_details_keys(app, k, ws_tx).await; }
 
     handle_dashboard_keys(app, k, ws_tx).await
 }
@@ -1217,7 +1291,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
             app.session = SessionState::new();
             app.session.is_remote = addr != LOCAL_ADDR;
             // Close details if open — playlist belongs to old session
-            if app.ui.show_details { app.ui.close_details(); }
+            if app.ui.screen == Screen::Details { app.ui.close_details(); }
 
             let (mut ws_tx, mut ws_rx) = ws.split();
 
@@ -1227,7 +1301,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                         match msg {
                             Some(Ok(Message::Text(text))) => {
                                 let node_down = process_event(&mut app, &text);
-                                if app.ui.show_details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
+                                if app.ui.screen == Screen::Details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
                                 if node_down {
                                     tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
                                     continue 'reconnect;
@@ -1251,7 +1325,7 @@ async fn run(terminal: &mut Term) -> io::Result<()> {
                                     KeyAction::Reconnect     => break 'reconnect,
                                     KeyAction::Render        => render(terminal, &app)?,
                                     KeyAction::RenderDetails => {
-                                        if app.ui.show_details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
+                                        if app.ui.screen == Screen::Details { render_details(terminal, &app)?; } else { render(terminal, &app)?; }
                                     }
                                     KeyAction::Nothing => {}
                                 }

@@ -3,10 +3,10 @@
   "name": "PaneBot",
   "version": "0.1.0",
   "description": "Send URLs to PaneBot panes",
-  "permissions": ["activeTab", "contextMenus", "storage", "clipboardRead"],
+  "permissions": ["activeTab", "contextMenus", "storage", "clipboardRead", "tabs"],
   "host_permissions": [
-    "ws://127.0.0.1:9090/",
-    "ws://192.168.*.*:9090/"
+    "wss://127.0.0.1:9090/",
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "background.js"

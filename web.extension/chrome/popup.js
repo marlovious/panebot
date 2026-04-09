@@ -2,19 +2,19 @@
 // PaneBot Chrome Extension — popup.js
 // ---------------------------------------------------------------------------
 
-const LOCAL_ADDR = 'ws://127.0.0.1:9090';
+const LOCAL_ADDR = 'wss://127.0.0.1:9090';
 
 let currentUrl   = '';
-let selectedPane = null;  // { address, pane }
+let selectedPane = null;
 let loadMode     = 'append-play';
 let allHosts     = [];
+let sockets      = [];  // all open connections
 
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 document.addEventListener('DOMContentLoaded', async () => {
-  // Check for URL passed from context menu
   const session = await chrome.storage.session.get('pendingUrl');
   if (session.pendingUrl) {
     currentUrl = session.pendingUrl;
@@ -25,7 +25,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
   document.getElementById('url-display').textContent = currentUrl;
 
-  // Paste button
   document.getElementById('paste-btn').addEventListener('click', async () => {
     try {
       const text = await navigator.clipboard.readText();
@@ -33,12 +32,9 @@ document.addEventListener('DOMContentLoaded', async () => {
         currentUrl = text.trim();
         document.getElementById('url-display').textContent = currentUrl;
       }
-    } catch {
-      setStatus('Clipboard access denied', 'error');
-    }
+    } catch { setStatus('Clipboard access denied', 'error'); }
   });
 
-  // Mode buttons
   document.querySelectorAll('.mode-btn').forEach(btn => {
     btn.addEventListener('click', () => {
       document.querySelectorAll('.mode-btn').forEach(b => b.classList.remove('active'));
@@ -49,128 +45,98 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   document.getElementById('send-btn').addEventListener('click', sendToPane);
 
-  connectAndLoad();
+  connect(LOCAL_ADDR, 'local', true);
 });
 
 // ---------------------------------------------------------------------------
-// Single connection — get snapshot + state, done
+// Connect — opens a persistent WebSocket, stays open until popup closes
 // ---------------------------------------------------------------------------
 
-function connectAndLoad() {
-  const ws      = new WebSocket(LOCAL_ADDR);
-  let   settled = false;
-
-  const finish = () => {
-    if (settled) return;
-    settled = true;
-    ws.close();
-    renderPanes();
-  };
-
-  // Give the daemon 600ms to send everything then close
-  const timer = setTimeout(finish, 600);
+function connect(address, label, isLocal) {
+  const ws = new WebSocket(address);
+  sockets.push(ws);
 
   ws.onmessage = (evt) => {
     let msg;
     try { msg = JSON.parse(evt.data); } catch { return; }
 
     if (msg.event === 'node:snapshot') {
-      const localHost = {
-        label:   msg.hostname || 'local',
-        address: LOCAL_ADDR,
-        panes:   (msg.panes || []).map(p => ({
-          name:      p.name,
-          pane_name: p.pane_name,
-          online:    false,
-          paused:    null,
-          idle:      null,
+      const host = {
+        label:     msg.hostname || label,
+        address,
+        collapsed: !isLocal,
+        panes:     (msg.panes || []).map(p => ({
+          name: p.name, pane_name: p.pane_name,
+          online: false, paused: null, idle: null,
         })),
       };
-      allHosts = [localHost];
-
-      // Queue remote host fetches
-      const knownHosts = msg.known_hosts || [];
-      if (knownHosts.length > 0) {
-        Promise.all(knownHosts.map(h => fetchRemoteSnapshot(h.label, h.address)))
-          .then(results => {
-            results.forEach(r => { if (r) allHosts.push(r); });
-            renderPanes();
-          });
-      }
-    }
-
-    if (msg.event === 'online') {
-      applyOnline(msg);
-      renderPanes();
-    }
-    if (msg.event === 'offline') {
-      applyOffline(msg);
-      renderPanes();
-    }
-  };
-
-  ws.onopen  = () => {};
-  ws.onerror = () => {
-    clearTimeout(timer);
-    setStatus('Daemon not found at ' + LOCAL_ADDR, 'error');
-    document.getElementById('pane-list').innerHTML = '<div id="connecting">Daemon offline</div>';
-  };
-  ws.onclose = () => clearTimeout(timer);
-}
-
-// ---------------------------------------------------------------------------
-// Remote snapshot — one connection, 500ms timeout
-// ---------------------------------------------------------------------------
-
-function fetchRemoteSnapshot(label, address) {
-  return new Promise((resolve) => {
-    const ws      = new WebSocket(address);
-    const timeout = setTimeout(() => { ws.close(); resolve(null); }, 500);
-
-    ws.onmessage = (evt) => {
-      let msg;
-      try { msg = JSON.parse(evt.data); } catch { return; }
-      if (msg.event === 'node:snapshot') {
-        clearTimeout(timeout);
-        ws.close();
-        resolve({
-          label:   label || msg.hostname || address,
-          address: address,
-          panes:   (msg.panes || []).map(p => ({
-            name:      p.name,
-            pane_name: p.pane_name,
-            online:    false,
-            paused:    null,
-            idle:      null,
-          })),
+      if (isLocal) {
+        allHosts = [host];
+        // Connect to remote nodes from known_hosts
+        (msg.known_hosts || []).forEach(h => {
+          if (!sockets.find(s => s.url === h.address)) connect(h.address, h.label, false);
         });
+      } else {
+        const idx = allHosts.findIndex(h => h.address === address);
+        if (idx >= 0) allHosts[idx] = { ...allHosts[idx], ...host };
+        else allHosts.push(host);
       }
-    };
-    ws.onerror = () => { clearTimeout(timeout); resolve(null); };
-  });
+      renderPanes();
+    }
+
+    if (msg.event === 'online' || msg.event === 'offline') {
+      const host = allHosts.find(h => h.address === address);
+      if (host) { applyState(host, msg, msg.event === 'online'); renderPanes(); }
+    }
+
+    if (msg.event === 'property-change') {
+      const host = allHosts.find(h => h.address === address);
+      if (!host) return;
+      const pane = host.panes.find(p => p.name === msg.pane);
+      if (!pane) return;
+      if (msg.property === 'pause')       pane.paused = msg.value;
+      if (msg.property === 'idle-active') pane.idle   = msg.value;
+      renderPanes();
+    }
+  };
+
+  ws.onerror = () => {
+    sockets = sockets.filter(s => s !== ws);
+    if (isLocal) {
+      setStatus('Daemon not found at ' + LOCAL_ADDR, 'error');
+      document.getElementById('pane-list').innerHTML = '<div id="connecting">Daemon offline</div>';
+    } else {
+      const idx = allHosts.findIndex(h => h.address === address);
+      const entry = { label, address, failed: true, collapsed: false, panes: [] };
+      if (idx >= 0) allHosts[idx] = entry; else allHosts.push(entry);
+      renderPanes();
+    }
+  };
+
+  ws.onclose = () => {
+    sockets = sockets.filter(s => s !== ws);
+    if (isLocal) {
+      setStatus('Daemon disconnected — retrying...', 'error');
+      setTimeout(() => {
+        setStatus('');
+        connect(LOCAL_ADDR, 'local', true);
+      }, 2000);
+    }
+  };
 }
 
 // ---------------------------------------------------------------------------
-// State helpers
+// State helper
 // ---------------------------------------------------------------------------
 
-function applyOnline(msg) {
-  const host = allHosts.find(h => h.address === LOCAL_ADDR);
-  if (!host) return;
+function applyState(host, msg, online) {
   const pane = host.panes.find(p => p.name === msg.pane);
   if (!pane) return;
-  pane.online = true;
-  if (msg.state) {
+  pane.online = online;
+  if (online && msg.state) {
     if (msg.state.paused      !== undefined) pane.paused = msg.state.paused;
     if (msg.state.idle_active !== undefined) pane.idle   = msg.state.idle_active;
   }
-}
-
-function applyOffline(msg) {
-  const host = allHosts.find(h => h.address === LOCAL_ADDR);
-  if (!host) return;
-  const pane = host.panes.find(p => p.name === msg.pane);
-  if (pane) pane.online = false;
 }
 
 // ---------------------------------------------------------------------------
@@ -188,24 +154,41 @@ function renderPanes() {
 
   allHosts.forEach(host => {
     const hostEl = document.createElement('div');
-    hostEl.className = 'host-label';
-    hostEl.textContent = host.label + ' :: ' + host.address;
+    hostEl.className    = 'host-label' + (host.failed ? ' failed' : '');
+    hostEl.style.cursor = 'pointer';
+    hostEl.textContent  = (host.collapsed ? '▶ ' : '▼ ') + host.label + ' :: ' + host.address;
+
+    if (host.failed) {
+      const trust = document.createElement('a');
+      trust.textContent = ' ⚠ Trust';
+      trust.href = '#';
+      trust.style.cssText = 'color:#c08030;text-decoration:none;float:right;';
+      trust.addEventListener('click', (e) => {
+        e.preventDefault();
+        chrome.tabs.create({ url: host.address.replace('wss://', 'https://') });
+      });
+      hostEl.appendChild(trust);
+    }
+
+    hostEl.addEventListener('click', () => { host.collapsed = !host.collapsed; renderPanes(); });
     list.appendChild(hostEl);
 
+    if (host.failed || host.collapsed) return;
+
     host.panes.forEach(pane => {
-      const row    = document.createElement('div');
+      const row = document.createElement('div');
       row.className = 'pane-row';
-      if (selectedPane && selectedPane.address === host.address && selectedPane.pane === pane.name) {
+      if (selectedPane?.address === host.address && selectedPane?.pane === pane.name) {
         row.classList.add('selected');
       }
 
-      const nameEl   = document.createElement('span');
-      nameEl.className = 'pane-name';
+      const nameEl = document.createElement('span');
+      nameEl.className   = 'pane-name';
       nameEl.textContent = pane.pane_name || pane.name;
 
       const statusEl = document.createElement('span');
       const { label, cls } = statusLabel(pane);
-      statusEl.className = 'pane-status ' + cls;
+      statusEl.className   = 'pane-status ' + cls;
       statusEl.textContent = label;
 
       row.appendChild(nameEl);
@@ -238,14 +221,9 @@ function statusLabel(pane) {
 
 function sendToPane() {
   if (!selectedPane || !currentUrl) return;
-
   const ws = new WebSocket(selectedPane.address);
   ws.onopen = () => {
-    ws.send(JSON.stringify({
-      command: 'loadfile',
-      pane:    selectedPane.pane,
-      args:    [currentUrl, loadMode],
-    }));
+    ws.send(JSON.stringify({ command: 'loadfile', pane: selectedPane.pane, args: [currentUrl, loadMode] }));
     setTimeout(() => ws.close(), 300);
     setStatus('Sent to ' + selectedPane.pane, 'ok');
   };

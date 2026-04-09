@@ -555,6 +555,11 @@ async fn handle_ws(
         Err(_) => return,
     };
 
+    let mut log = match Logger::open() {
+        Ok(l)  => l,
+        Err(_) => return,
+    };
+
     let (mut sink, mut source) = ws.split();
     let mut rx = tx.subscribe();
 
@@ -585,7 +590,7 @@ async fn handle_ws(
             msg = source.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
-                        handle_command(&text, &state, &cmds, &panes, &tx, &shutdown, &layout).await;
+                        handle_command(&text, &state, &cmds, &panes, &tx, &shutdown, &layout, &mut log).await;
                     }
                     Some(Ok(Message::Close(_))) | None => break,
                     _ => {}
@@ -607,6 +612,7 @@ async fn handle_command(
     tx:       &broadcast::Sender<String>,
     shutdown: &ShutdownTx,
     layout:   &SharedLayout,
+    log:      &mut Logger,
 ) {
     let v: serde_json::Value = match serde_json::from_str(text) {
         Ok(v)  => v,
@@ -619,7 +625,7 @@ async fn handle_command(
     };
 
     if cmd.starts_with("panebot:") {
-        handle_node_command(&cmd, &v, state, cmds, panes, tx, shutdown, layout).await;
+        handle_node_command(&cmd, &v, state, cmds, panes, tx, shutdown, layout, log).await;
         return;
     }
 
@@ -715,6 +721,7 @@ async fn handle_node_command(
     tx:       &broadcast::Sender<String>,
     shutdown: &ShutdownTx,
     layout:   &SharedLayout,
+    log:      &mut Logger,
 ) {
     match cmd {
 
@@ -766,7 +773,6 @@ async fn handle_node_command(
                                                 }).unwrap());
                                             }
                                             Err(e) => {
-                                                let mut log = Logger::open().unwrap();
                                                 log.log(&format!("playlist-save :: write failed: {}", e));
                                             }
                                         }
@@ -777,22 +783,20 @@ async fn handle_node_command(
                     }
                 }
                 Err(e) => {
-                    let mut log = Logger::open().unwrap();
                     log.log(&format!("playlist-save :: socket error: {}", e));
                 }
             }
         }
 
         "panebot:restart-all" => {
-            let mut log     = Logger::open().unwrap();
             let layout_name = layout.lock().unwrap().clone();
-            let layout_map  = load_layout(&layout_name, &mut log);
+            let layout_map  = load_layout(&layout_name, log);
             let p = panes.read().await;
-            for pane in p.iter() { kill_pane_async(&pane.mpv_name, &mut log).await; }
+            for pane in p.iter() { kill_pane_async(&pane.mpv_name, log).await; }
             tokio::time::sleep(Duration::from_millis(RESTART_ALL_WAIT_MS)).await;
             for pane in p.iter() {
                 let geo = layout_map.as_ref().and_then(|m| m.get(&pane.mpv_name)).and_then(|e| e.geometry.as_deref());
-                launch_pane(pane, geo, &mut log);
+                launch_pane(pane, geo, log);
             }
             let _ = tx.send(serde_json::to_string(&DaemonEvent::NodeRestartAll).unwrap());
         }
@@ -801,29 +805,27 @@ async fn handle_node_command(
             let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
             let p = panes.read().await;
             if let Some(pane) = p.iter().find(|p| p.mpv_name == pane_name) {
-                let mut log     = Logger::open().unwrap();
                 let layout_name = layout.lock().unwrap().clone();
-                let layout_map  = load_layout(&layout_name, &mut log);
-                kill_pane_async(&pane.mpv_name, &mut log).await;
+                let layout_map  = load_layout(&layout_name, log);
+                kill_pane_async(&pane.mpv_name, log).await;
                 tokio::time::sleep(Duration::from_millis(RESTART_PANE_WAIT_MS)).await;
                 let geo = layout_map.as_ref().and_then(|m| m.get(&pane.mpv_name)).and_then(|e| e.geometry.as_deref());
-                launch_pane(pane, geo, &mut log);
+                launch_pane(pane, geo, log);
                 let _ = tx.send(serde_json::to_string(&DaemonEvent::NodeRestartPane { pane: pane_name }).unwrap());
             }
         }
 
         "panebot:layout" => {
             let layout_name = match v["layout_name"].as_str() { Some(n) => n.to_string(), None => return };
-            let mut log = Logger::open().unwrap();
-            if let Some(layout_map) = load_layout(&layout_name, &mut log) {
+            if let Some(layout_map) = load_layout(&layout_name, log) {
                 *layout.lock().unwrap() = layout_name.clone();
                 let p = panes.read().await;
                 log.log(&format!("layout :: switching to {} — restarting {} panes", layout_name, p.len()));
-                for pane in p.iter() { kill_pane_async(&pane.mpv_name, &mut log).await; }
+                for pane in p.iter() { kill_pane_async(&pane.mpv_name, log).await; }
                 tokio::time::sleep(Duration::from_millis(RESTART_ALL_WAIT_MS)).await;
                 for pane in p.iter() {
                     let geo = layout_map.get(&pane.mpv_name).and_then(|e| e.geometry.as_deref());
-                    launch_pane(pane, geo, &mut log);
+                    launch_pane(pane, geo, log);
                 }
                 let _ = tx.send(serde_json::to_string(&DaemonEvent::NodeLayout { layout: layout_name }).unwrap());
             }
@@ -831,10 +833,9 @@ async fn handle_node_command(
 
         // Clone an existing pane — new mpv_name, copies source mpv.conf, launches with size-only geometry
         "panebot:clone-pane" => {
-            let src_name  = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
-            let new_name  = match v["new_name"].as_str() { Some(n) => n.to_string(), None => return };
+            let src_name    = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
+            let new_name    = match v["new_name"].as_str() { Some(n) => n.to_string(), None => return };
             let new_display = v["pane_name"].as_str().unwrap_or(&new_name).to_string();
-            let mut log   = Logger::open().unwrap();
 
             let src_pane = { panes.read().await.iter().find(|p| p.mpv_name == src_name).cloned() };
             if src_pane.is_none() { log.log(&format!("clone :: {} not found", src_name)); return; }
@@ -850,7 +851,6 @@ async fn handle_node_command(
             if src_conf.exists() {
                 let _ = std::fs::copy(&src_conf, &dest_conf);
             } else {
-                // Write fresh conf if source has none
                 if let Ok(mut f) = std::fs::File::create(&dest_conf) {
                     let _ = writeln!(f, "force-window=yes\nidle=yes\nreally-quiet=yes\npause=yes\nvolume=100\nmute=yes\ndirectory-mode=recursive");
                 }
@@ -864,27 +864,24 @@ async fn handle_node_command(
 
             // Get source geometry for size-only launch (strip position)
             let layout_name = layout.lock().unwrap().clone();
-            let layout_map  = load_layout(&layout_name, &mut log);
+            let layout_map  = load_layout(&layout_name, log);
             let size_geo: Option<String> = layout_map.as_ref()
                 .and_then(|m| m.get(&src.mpv_name))
                 .and_then(|e| e.geometry.as_deref())
-                .and_then(|g| g.split('+').next())  // "WxH" only, drop +X+Y
+                .and_then(|g| g.split('+').next())
                 .map(|s| s.to_string());
 
-            launch_pane(&new_pane, size_geo.as_deref(), &mut log);
+            launch_pane(&new_pane, size_geo.as_deref(), log);
 
-            // Add to panes vec and write panes.conf
             {
                 let mut p = panes.write().await;
                 p.push(new_pane.clone());
                 write_panes_conf(&p);
             }
 
-            // Spawn monitor for new pane
             let s2 = state.clone(); let t2 = tx.clone(); let c2 = cmds.clone();
             tokio::spawn(async move { monitor_pane(new_pane, s2, t2, c2).await; });
 
-            // Broadcast updated snapshot
             broadcast_snapshot(&panes, &layout, &tx).await;
             log.log(&format!("clone :: {} → {}", src_name, new_name));
         }
@@ -892,8 +889,7 @@ async fn handle_node_command(
         // Remove a pane — kill mpv, remove from vec, write panes.conf
         "panebot:remove-pane" => {
             let pane_name = match v["pane"].as_str() { Some(n) => n.to_string(), None => return };
-            let mut log   = Logger::open().unwrap();
-            kill_pane_async(&pane_name, &mut log).await;
+            kill_pane_async(&pane_name, log).await;
             {
                 let mut p = panes.write().await;
                 p.retain(|pane| pane.mpv_name != pane_name);
@@ -1045,22 +1041,8 @@ async fn main() {
         }
     }
 
-    let known_hosts = load_hosts();
-
     let panes: SharedPanes = Arc::new(tokio::sync::RwLock::new(cfg.panes.clone()));
 
-    let node_snapshot = {
-        let p = panes.read().await;
-        serde_json::to_string(&DaemonEvent::NodeSnapshot {
-            hostname:    hostname(),
-            platform:    platform().to_string(),
-            ip:          display_ip.clone(),
-            layout:      cfg.layout.clone(),
-            home:        cfg.home.clone(),
-            panes:       p.iter().map(|p| PaneInfo { name: p.mpv_name.clone(), pane_name: p.pane_name.clone() }).collect(),
-            known_hosts: known_hosts.clone(),
-        }).unwrap()
-    };
     let state:    SharedState  = Arc::new(Mutex::new(HashMap::new()));
     let cmds:     PaneCommands = Arc::new(Mutex::new(HashMap::new()));
     let shutdown: ShutdownTx   = Arc::new(tokio::sync::Notify::new());
@@ -1126,11 +1108,26 @@ async fn main() {
                 };
                 let s  = state.clone();
                 let t  = tx.clone();
-                let sn = node_snapshot.clone();
                 let c  = cmds.clone();
                 let p  = panes.clone();
                 let sd = shutdown.clone();
                 let la = layout.clone();
+                // Build fresh snapshot for each connection
+                let sn = {
+                    let p_read = p.read().await;
+                    let hosts  = load_hosts();
+                    let dm     = load_daemon_mode();
+                    let ip     = if dm == "remote" { local_ip() } else { "127.0.0.1".to_string() };
+                    serde_json::to_string(&DaemonEvent::NodeSnapshot {
+                        hostname:    hostname(),
+                        platform:    platform().to_string(),
+                        ip,
+                        layout:      la.lock().unwrap().clone(),
+                        home:        panebot_lib::home_dir(),
+                        panes:       p_read.iter().map(|p| PaneInfo { name: p.mpv_name.clone(), pane_name: p.pane_name.clone() }).collect(),
+                        known_hosts: hosts,
+                    }).unwrap()
+                };
                 tokio::spawn(async move {
                     handle_ws(tls_stream, s, t, sn, c, p, sd, la).await;
                 });
