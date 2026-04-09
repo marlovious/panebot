@@ -1,130 +1,279 @@
-# panebot
+# PaneBot
 
-> *Just the streams.*
+> **Just The Streams.**
 
----
+Distributed mpv orchestration system. Control multiple video panes across one or more machines from a terminal UI or browser extension. Built for media walls, unattended nodes, and anyone who wants real control over what's playing and where.
 
-Most video software wants to be your media center. panebot just wants to get out of the way.
-
-It's a terminal UI for managing multiple `mpv` instances as named, independently controllable display targets — a keyboard-driven dashboard for people who'd rather type than click, and who think a clean wall of video with no chrome around it looks exactly right.
-
-The use case is broader than it sounds: local playback, HTTP streams, RTSP camera feeds, debrid sources, live broadcast monitoring. Anything mpv can play, panebot can route to a named pane and give you a single place to see and control all of it.
+[ [Concept](#concept) | [Architecture](#architecture) | [Quick Start](#quick-start) | [Config](#configuration) | [Key Bindings](#key-bindings) ]
 
 ---
 
-## What it looks like
+## Concept
+
+PaneBot doesn't care where your streams come from. Debrid, YouTube, RTMP, local files, clipboard URLs — it routes them to the right pane and gets out of the way.
+
+A **node** is a machine running `panebot-daemon`. Each daemon manages a set of mpv instances (panes), monitors their state over IPC, and serves a WebSocket API. The **TUI** connects to any node on your LAN and gives you full control. The **browser extension** lets you send URLs from any tab directly to any pane on any node.
 
 ```
-[PaneBot]  ::  Active Panes ::
-:: "TV"      :: [video] :: [Playing] :: [Vol:100%] :: Harvesting the Dreamtime
-   "Movies"  :: [video] :: [Stopped] :: [Vol: 75%] :: —
-   "Web"     :: [http ] :: [Playing] :: [Vol:Mute] :: Star.Trek.S02e02.1080p.mkv
-   "CAM1"    :: [rtsp ] :: [Playing] :: [Vol:Mute] :: —
+Browser Extension
+      │
+      │ wss://
+      ▼
+┌─────────────────────────────────────────────┐
+│  PaneBot Dashboard (panebot-tui)            │
+│  Terminal UI — connects to any node         │
+└────────────────┬────────────────────────────┘
+                 │ wss://
+        ┌────────┴────────┐
+        │                 │
+        ▼                 ▼
+┌──────────────┐   ┌──────────────┐
+│  PaneBot     │   │  PaneBot     │
+│  Daemon      │   │  Daemon      │
+│  (macOS)     │   │  (Linux)     │
+└──────┬───────┘   └──────┬───────┘
+       │ IPC              │ IPC
+  ┌────┴────┐        ┌────┴────┐
+  │   mpv   │        │   mpv   │  ×N
+  │  ×N     │        │         │
+  └─────────┘        └─────────┘
 ```
 
 ---
 
-## Features
+## Architecture
 
-- **Dashboard** — all panes at a glance, live status, volume, currently playing title
-- **Playlist management** — browse, add, remove, and reorder items per pane
-- **Command mode** — play/pause, seek, volume, next/prev without leaving the TUI
-- **Multiple content types** — video, audio, HTTP streams, yt-dlp, RTSP/camera feeds
-- **Per-pane mpv config** — independent mpv option overrides per pane
-- **Persistent playlists** — m3u files per pane, restored on relaunch
-- **Geometry support** — pin pane windows to specific screen positions and dimensions
-- **Tab completion** — path completion when adding local content
+### PaneBot Dashboard — `panebot-tui`
+
+Ratatui terminal UI. Connects to any daemon over WSS. Three-screen navigation:
+
+```
+Log  ←[h/l]→  Panes  ←[h/l]→  Details (Playlist)
+```
+
+Pane state (playing, paused, stopped, volume, title) is updated live from the daemon. Command mode (`Tab`) gives direct mpv control — seek, volume, fullscreen, passthrough.
+
+### PaneBot Service — `panebot-daemon`
+
+Async Tokio WebSocket server (port 9090, WSS). One daemon per node. Manages:
+
+- Launching and monitoring mpv instances over Unix sockets
+- Broadcasting typed events to all connected clients
+- Accepting commands (loadfile, playlist ops, layout switch, restart)
+- Serving its known host list so the TUI and extension can discover other nodes
+
+Self-signed TLS cert generated on first boot (`pb.crt`, `pb.key`). On Linux, runs as a systemd user service under `uwsm`.
+
+### PaneBot Node OS — Linux
+
+Cheap ThinkPad running Debian testing + Hyprland. The daemon starts with the session, panes spawn into the tiling layout in order, the display mirrors to HDMI. No desktop, no browser, no overhead — just streams.
 
 ---
 
-## Pane types
+## Directory Layout
 
-| Type    | Use case                                      |
-|---------|-----------------------------------------------|
-| `video` | Local files, network filesystem               |
-| `audio` | Music, podcasts, audio-only                   |
-| `http`  | Hosted streams, cloud, debrid                 |
-| `ytdlp` | YouTube via yt-dlp                            |
-| `rtsp`  | Live feeds, IP cameras, broadcast backline    |
+```
+~/.config/panebot/
+├── pb.panes.conf          # pane definitions + active layout
+├── pb.daemon.conf         # mode (local/remote) + known remote nodes
+├── pb.crt                 # TLS certificate (auto-generated)
+├── pb.key                 # TLS private key (auto-generated)
+├── pb.hypr.conf           # Hyprland window rules (sourced by hyprland.conf)
+├── panebot-daemon.log     # daemon log
+├── layouts/
+│   ├── pb.left.stack.layout
+│   └── pb.right.stack.layout
+├── music/
+│   ├── music.mpv.conf
+│   ├── music.m3u          # playlist — launch config and save target
+│   ├── music.sock         # mpv IPC socket
+│   └── scripts/
+├── wide-top/
+├── wide-bottom/
+└── standard/
+```
+
+Each pane gets its own directory named after its `mpv_name`. The `.mpv.conf` is written once by bootstrap and edited freely. The `.m3u` is the launch playlist — mpv loads it at startup, and the daemon can save the live playlist back to it.
 
 ---
 
-## Requirements
+## Playlists and Live State
 
-- Rust (to build)
-- `mpv`
-- `yt-dlp` (for ytdlp panes)
+**mpv is truth.** The `.m3u` file is a launch config, not a live record. Once mpv is running, the daemon queries its IPC socket for the current playlist, track position, and state. The TUI reflects live mpv state — not what's on disk.
+
+Saving a playlist (`S` in Details) queries mpv directly and writes the current live playlist back to any path you choose.
+
+```
+pb.panes.conf ──► mpv --playlist=music.m3u
+                       │
+                       ▼
+                  [mpv running]
+                       │
+              observe_property: pause, volume,
+              media-title, playlist-pos, mute,
+              idle-active
+                       │
+                       ▼
+              panebot-daemon broadcasts
+              DaemonEvent::PropertyChange
+              to all connected clients
+```
+
+---
+
+## Quick Start
+
+### macOS
+
+```bash
+# build
+git clone https://github.com/marlovious/marlovious.panebot
+cd marlovious.panebot/tui
+cargo build --release
+
+# install binaries
+cp target/release/panebot-daemon /usr/local/bin/
+cp target/release/panebot-tui    /usr/local/bin/
+
+# first run — bootstraps config, generates TLS cert, launches mpv panes
+panebot-daemon &
+panebot-tui
+```
+
+### Linux (Hyprland + systemd)
+
+```bash
+# build
+cargo build --release
+sudo cp target/release/panebot-daemon /usr/local/bin/
+
+# enable as systemd user service
+# ~/.config/systemd/user/panebot-daemon.service
+systemctl --user enable --now panebot-daemon
+
+# add to hyprland.conf
+echo "source = ~/.config/panebot/pb.hypr.conf" >> ~/.config/hypr/hyprland.conf
+```
+
+### Browser Extension
+
+Load `tui/extension/` as an unpacked extension in Chrome/Brave. On first connection to each node, visit `https://nodeip:9090` in the browser to accept the self-signed cert.
 
 ---
 
 ## Configuration
 
-Panes are defined in `~/.config/panebot/panes.conf`:
+### `pb.panes.conf`
 
 ```ini
-[TV]
-socket   = ~/.config/panebot/TV/TV.sock
-type     = video
-geometry = 960x540+0+0
-playlist = -
+layout = pb.left.stack
 
-[CAM1]
-socket   = ~/.config/panebot/CAM1/CAM1.sock
-type     = rtsp
-geometry = 480x270+960+0
-playlist = -
+[music]
+pane_name = Music
+
+[wide-top]
+pane_name = Wide Top
+
+[wide-bottom]
+pane_name = Wide Bottom
+
+[standard]
+pane_name = Standard
 ```
 
-For first-time setup, run `panebot-setup.sh`.
+`mpv_name` (the section header) is permanent — it drives the directory, socket, and config file. `pane_name` is display only and can be changed freely.
+
+### `pb.daemon.conf`
+
+```ini
+# mode = local    bind to 127.0.0.1 (default)
+# mode = remote   bind to 0.0.0.0, accept LAN connections
+
+mode = remote
+
+[linux-node]
+address = wss://192.168.1.x:9090
+```
+
+### Layout files
+
+```ini
+# ~/.config/panebot/layouts/pb.left.stack.layout
+
+[music]
+geometry = 366x366+0+0
+
+[wide-top]
+geometry = 650x366+0+374
+```
+
+On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order drives Hyprland master layout placement.
 
 ---
 
-## Keybindings
+## Key Bindings
 
 ### Dashboard
 
-| Key        | Action              |
-|------------|---------------------|
-| `↑ / ↓`   | Select pane         |
-| `Tab`      | Enter command mode  |
-| `Enter`    | Open playlist view  |
-| `q`        | Quit                |
+| Key | Action |
+|-----|--------|
+| `j / k` | Navigate panes |
+| `h / l` | Switch screen (Log ↔ Panes ↔ Details) |
+| `Tab` | Enter command mode |
+| `S` | Solo pane (mute others, fullscreen, play) |
+| `M` | Mute all others |
+| `P` | Pause / unpause all |
+| `r` | Restart selected pane |
+| `R` | Restart all panes |
+| `W` | Switch layout |
+| `C` | Connect to different node |
+| `q` | Quit |
 
-### Command mode
+### Command Mode (`Tab`)
 
-| Key          | Action       |
-|--------------|--------------|
-| `Space`      | Play / Pause |
-| `m`          | Mute         |
-| `= / -`      | Volume       |
-| `← / →`      | Seek ±10s    |
-| `↑ / ↓`      | Seek ±1m     |
-| `n / N`      | Next / Prev  |
-| `Tab`        | Exit         |
+| Key | Action |
+|-----|--------|
+| `Space` | Toggle pause |
+| `m` | Toggle mute |
+| `f` | Toggle fullscreen |
+| `h / l` | Seek ±5s |
+| `j / k` | Seek ±60s |
+| `9 / 0` | Volume ±5 |
+| `v` | Enter mpv passthrough |
+| `Tab` | Exit command mode |
 
-### Playlist view
+### Details (Playlist)
 
-| Key         | Action              |
-|-------------|---------------------|
-| `↑ / ↓`    | Select item         |
-| `Tab`       | Item command mode   |
-| `n`         | Add to playlist     |
-| `c`         | Clear playlist      |
-| `Backspace` | Return to dashboard |
+| Key | Action |
+|-----|--------|
+| `j / k` | Navigate items |
+| `Enter` | Play now (confirm) |
+| `n` | Queue next |
+| `Space` | Mark item |
+| `/` | Search |
+| `D` | Delete item(s) |
+| `M` | Move marked items |
+| `C` | Crop to marked / playing |
+| `A` | Add URL or path |
+| `S` | Save playlist |
+| `G` | Jump to index |
+| `h` | Back to dashboard |
+
+### mpv Passthrough (`v`)
+
+All keys forward directly to mpv. Exit with `v`.
 
 ---
 
-## Roadmap
+## Requirements
 
-- HTTP endpoint for pushing content to panes from browser, file manager, or remote host
-- Browser extension — right-click any stream URL, send to a named pane
-- Per-host daemon for multi-display and network deployments
-- Named layout files for switching between pane configurations
+- `mpv`
+- Rust (build only)
+- Hyprland (Linux node, optional)
+- `uwsm` (Linux systemd session, optional)
 
 ---
 
-## Philosophy
+## License
 
-mpv handles the rendering. panebot handles the orchestration. No Electron, no GUI framework, no media center assumptions. The terminal is the right control surface for this — fast, keyboard-native, SSH-accessible, and completely invisible to the content it's managing.
-
-Just the streams.
+MIT
