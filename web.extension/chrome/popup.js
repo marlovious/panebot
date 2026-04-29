@@ -103,7 +103,13 @@ function connect(address, label, isLocal) {
   ws.onerror = () => {
     sockets = sockets.filter(s => s !== ws);
     if (isLocal) {
-      setStatus('Daemon not found at ' + LOCAL_ADDR, 'error');
+      chrome.storage.local.get('certTrusted', (data) => {
+        if (!data.certTrusted) {
+          chrome.storage.local.set({ certTrusted: true });
+          chrome.tabs.create({ url: LOCAL_ADDR.replace('wss://', 'https://') });
+        }
+      });
+      setStatus('Daemon not found — trust cert in new tab', 'error');
       document.getElementById('pane-list').innerHTML = '<div id="connecting">Daemon offline</div>';
     } else {
       const idx = allHosts.findIndex(h => h.address === address);
