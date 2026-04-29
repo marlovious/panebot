@@ -59,7 +59,7 @@ Browser Extension
 Ratatui terminal UI. Connects to any daemon over WSS. Three-screen navigation:
 
 ```
-Log  ←[h/l]→  Panes  ←[h/l]→  Details (Playlist)
+Log  ←[←/→]→  Panes  ←[←/→]→  Details (Playlist)
 ```
 
 Pane state (playing, paused, stopped, volume, title) is updated live from the daemon. Command mode (`Tab`) gives direct mpv control — seek, volume, fullscreen, passthrough.
@@ -235,8 +235,8 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate panes |
-| `h` / `l` | Switch screen (Log ↔ Panes ↔ Details) |
+| `j` / `k` / `↑` / `↓` | Navigate panes |
+| `h` / `l` / `←` / `→` | Switch screen (Log ↔ Panes ↔ Details) |
 | `Tab` | Enter command mode |
 | `S` | Solo pane (mute others, fullscreen, play) |
 | `M` | Mute all others |
@@ -254,8 +254,8 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `Space` | Toggle pause |
 | `m` | Toggle mute |
 | `f` | Toggle fullscreen |
-| `h` / `l` | Seek ±5s |
-| `j` / `k` | Seek ±60s |
+| `h` / `l` / `←` / `→` | Seek ±5s |
+| `j` / `k` / `↑` / `↓` | Seek ±60s |
 | `9` / `0` | Volume ±5 |
 | `v` | Enter mpv passthrough |
 | `Tab` | Exit command mode |
@@ -264,7 +264,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate items |
+| `j` / `k` / `↑` / `↓` | Navigate items |
 | `Enter` | Play now |
 | `n` | Queue next |
 | `Space` | Mark item |
@@ -275,7 +275,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `A` | Add URL or path |
 | `S` | Save playlist |
 | `G` | Jump to index |
-| `h` | Back to dashboard |
+| `h` / `←` | Back to dashboard |
 
 ### mpv Passthrough (`v`)
 
