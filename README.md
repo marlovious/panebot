@@ -2,6 +2,8 @@
 
 Distributed mpv orchestration system. Control multiple video panes across one or more machines from a terminal UI or browser extension. Built for media walls, unattended nodes, and anyone who wants real control over what's playing and where.
 
+![PaneBot Dashboard](assets/dashboard.png)
+
 [ [Concept](#concept) | [Use Cases](#use-cases) | [Architecture](#architecture) | [Quick Start](#quick-start) | [Configuration](#configuration) | [Key Bindings](#key-bindings) ]
 
 ---
@@ -36,8 +38,6 @@ Browser Extension
   │  ×N     │        │         │
   └─────────┘        └─────────┘
 ```
-
-![PaneBot Dashboard](assets/dashboard.png)
 
 ---
 
