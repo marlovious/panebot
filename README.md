@@ -37,6 +37,8 @@ Browser Extension
   └─────────┘        └─────────┘
 ```
 
+![PaneBot Dashboard](assets/dashboard.png)
+
 ---
 
 ## Use Cases
