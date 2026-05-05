@@ -1,4 +1,4 @@
-# <img src="assets/panebot.png" width="60" align="left" style="margin-right: 12px" /> PaneBot
+# <img src="assets/panebot.png" width="100" align="left" style="margin-right: 12px" /> PaneBot
 
 Just the streams.
 
