@@ -5,7 +5,6 @@ Multi-pane mpv controller with a terminal UI and browser extension. Run it local
 <br>
 <div align="center">
 [ [Concept](#concept) | [Use Cases](#use-cases) | [Design](#design) | [Quick Start](#quick-start) | [Reference](#reference) ]
-
 </div>
 
 ![PaneBot Dashboard](assets/dashboard.png)
