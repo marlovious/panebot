@@ -5,7 +5,7 @@ Multi-pane mpv controller with a terminal UI and browser extension. Run it local
 
 ![PaneBot Dashboard](assets/dashboard.png)
 
-[ [Concept](#concept) | [Use Cases](#use-cases) | [How It Works](#how-it-works) | [Quick Start](#quick-start) | [Configuration](#configuration) | [Key Bindings](#key-bindings) ]
+[ [Concept](#concept) | [Use Cases](#use-cases) | [Design](#design) | [Quick Start](#quick-start) | [Reference](#reference) ]
 
 ---
 
@@ -56,44 +56,28 @@ Browser Extension
 
 ---
 
-## How It Works
+## Design
 
-### `panebot-tui`
+**`panebot-daemon`** — Async Tokio WebSocket server (port 9090, WSS). The only process that owns mpv. Spawns and monitors mpv instances over Unix IPC sockets, broadcasts typed events to all connected clients. In `local` mode binds to `127.0.0.1`; in `remote` mode binds to `0.0.0.0` and accepts LAN connections. Self-signed TLS cert generated on first boot (`pb.crt`, `pb.key`).
 
-Ratatui terminal UI. Connects to any daemon over WSS. Three-screen navigation:
+**`panebot-tui`** — Ratatui terminal dashboard. Connects to any daemon over WSS. Three-screen navigation: `Log ←→ Panes ←→ Details`. Pane state — playing, paused, volume, title, position — updates live from the daemon. Command mode (`Tab`) passes input directly to mpv. Switch between daemons with `C`.
 
-```
-Log  ←[←/→]→  Panes  ←[←/→]→  Details (Playlist)
-```
+**Browser extension** — Adds a context menu item to any page. Right-click → Send to PaneBot → choose daemon and pane. Works with any URL mpv can open.
 
-Pane state — playing, paused, volume, title, position — is updated live from the daemon. Command mode (`Tab`) passes input directly to mpv. Switch between daemons with `C`.
+The daemon is the only process that owns mpv. The TUI, browser extension, and any other JSON client are peers — the daemon doesn't know or care which one it's talking to. Kill the TUI and reconnect — playback was never interrupted.
 
-### `panebot-daemon`
+State is event-driven end to end. The daemon subscribes to mpv property changes via `observe_property` — no polling anywhere in the stack. mpv pushes events; the daemon forwards them immediately to all connected clients. On connect, every client receives a full `node:snapshot` and is immediately synchronized.
 
-Async Tokio WebSocket server (port 9090, WSS). Manages mpv instances over Unix IPC sockets. Broadcasts typed events to all connected clients. Accepts commands — loadfile, playlist ops, layout switch, keypress passthrough, restart.
+The full mpv keyboard surface is available through a single `keypress` passthrough command. No enumeration of mpv IPC operations, no protocol maintenance as mpv evolves. The daemon stays thin. mpv stays authoritative.
 
-In `local` mode it binds to `127.0.0.1`. In `remote` mode it binds to `0.0.0.0` and accepts LAN connections. Self-signed TLS cert generated on first boot (`pb.crt`, `pb.key`).
-
-On Linux, the daemon can run as a systemd user service — see [panebot-node](#) for a reference deployment.
-
-### Browser Extension
-
-Adds a context menu item to any page. Right-click → Send to PaneBot → choose daemon and pane. The current tab URL loads immediately. Works with any URL mpv can open.
-
-Requires the daemon's self-signed certificate to be trusted in the browser — visit `https://host:9090` once per machine to accept it.
-
-### Protocol
-
-The daemon speaks a documented WebSocket protocol. Typed events flow out — `node:snapshot` on connect, `property-change` as state updates. Commands flow in. Any client that speaks JSON can connect to a daemon, receive live state, and send commands. The full protocol is documented in [`docs/protocol.md`](docs/protocol.md).
-
-### Workspace
+The protocol is documented and open. Any client that speaks JSON can connect, receive live state, send commands, and respond to playback events — including `idle-active`, which fires the moment a pane finishes playing. There is no proprietary API. See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ```
 panebot/
 ├── Cargo.toml              — workspace root
 ├── panebot-lib/            — shared types, config parsers, M3U utilities
-├── panebot-daemon/         — daemon
-└── panebot-tui/            — terminal controller
+├── panebot-daemon/         — Tokio async WebSocket server, mpv IPC
+└── panebot-tui/            — Ratatui terminal controller
 ```
 
 Binaries link statically. No shared runtime required.
@@ -158,11 +142,15 @@ To run the daemon as a systemd user service so it starts with your session:
 systemctl --user enable --now panebot-daemon
 ```
 
-For a dedicated remote display, see [panebot-node](#).
+**Browser extension:** the daemon's self-signed certificate must be trusted in your browser before the extension will work. Visit `https://host:9090` once per machine and accept the certificate.
+
+For a dedicated remote display, see [panebot-node](https://github.com/marlovious/panebot-node).
 
 ---
 
-## Directory Layout
+## Reference
+
+### Directory Layout
 
 ```
 ~/.config/panebot/
@@ -189,9 +177,9 @@ Each pane gets its own directory. The `.mpv.conf` is written once by bootstrap a
 
 ---
 
-## Configuration
+### Configuration
 
-### `pb.panes.conf`
+#### `pb.panes.conf`
 
 ```ini
 layout = pb.left.stack
@@ -211,7 +199,7 @@ pane_name = Standard
 
 The section header is the `mpv_name` — permanent identifier that drives the directory, socket, and config file. `pane_name` is display only.
 
-### `pb.daemon.conf`
+#### `pb.daemon.conf`
 
 ```ini
 # mode = local    bind to 127.0.0.1 (default)
@@ -223,7 +211,7 @@ mode = remote
 address = wss://192.168.1.x:9090
 ```
 
-### Layout files
+#### Layout files
 
 ```ini
 # ~/.config/panebot/layouts/pb.left.stack.layout
@@ -239,9 +227,9 @@ On macOS, geometry is passed as `--geometry` to mpv — PaneBot positions the wi
 
 ---
 
-## Key Bindings
+### Key Bindings
 
-### Dashboard
+#### Dashboard
 
 | Key | Action |
 |-----|--------|
@@ -257,7 +245,7 @@ On macOS, geometry is passed as `--geometry` to mpv — PaneBot positions the wi
 | `C` | Connect to different daemon |
 | `q` | Quit |
 
-### Command Mode (`Tab`)
+#### Command Mode (`Tab`)
 
 | Key | Action |
 |-----|--------|
@@ -270,7 +258,7 @@ On macOS, geometry is passed as `--geometry` to mpv — PaneBot positions the wi
 | `v` | Enter mpv passthrough |
 | `Tab` | Exit command mode |
 
-### Details (Playlist)
+#### Details (Playlist)
 
 | Key | Action |
 |-----|--------|
@@ -287,13 +275,13 @@ On macOS, geometry is passed as `--geometry` to mpv — PaneBot positions the wi
 | `G` | Jump to index |
 | `h` / `←` | Back to dashboard |
 
-### mpv Passthrough (`v`)
+#### mpv Passthrough (`v`)
 
 All keys forward directly to mpv. Exit with `v`.
 
 ---
 
-## Requirements
+### Requirements
 
 - mpv
 - Rust (build only)
