@@ -1,12 +1,16 @@
 # Protocol Reference
 
-PaneBot uses a JSON-over-WebSocket protocol. The daemon listens on port 9090 (TLS). All messages are JSON objects.
+The PaneBot daemon speaks a minimal JSON-over-WebSocket protocol designed around one principle: mpv is authoritative, the daemon is a relay.
+
+State flows out as events — the daemon never waits to be asked. Commands flow in as typed JSON. The `keypress` command gives any client the full mpv keyboard surface without the daemon enumerating every possible operation. The protocol is stable, documented, and intentionally small.
+
+The daemon listens on port 9090 (TLS). All messages are JSON objects.
 
 ---
 
 ## Connection
 
-On connect, the daemon immediately sends a `node:snapshot` containing the complete current state of all panes. No request required.
+On connect, the daemon immediately sends a `node:snapshot` containing the complete current state of all panes. No request required. A client that connects mid-session is immediately synchronized.
 
 ---
 
@@ -14,24 +18,30 @@ On connect, the daemon immediately sends a `node:snapshot` containing the comple
 
 ### `node:snapshot`
 
-Sent on client connect. Complete state of all panes.
+Sent on connect. Complete state of all panes.
 
 ```json
 {
   "event": "node:snapshot",
+  "hostname": "panebot",
+  "platform": "linux",
+  "ip": "192.168.1.100",
+  "layout": "pb.left.stack",
   "panes": [
     {
       "name": "wide-top",
-      "pane_name": "wide-top",
-      "state": "playing",
-      "title": "Stalker (1979)",
-      "volume": 80,
+      "pane_name": "Wide Top",
+      "online": true,
+      "paused": false,
       "muted": false,
+      "volume": 80,
+      "title": "Stalker (1979)",
       "playlist_pos": 2,
-      "playlist_count": 12,
-      "duration": 9576.0,
-      "position": 1823.4
+      "idle_active": false
     }
+  ],
+  "known_hosts": [
+    { "label": "remote-display", "address": "wss://192.168.1.101:9090" }
   ]
 }
 ```
@@ -45,7 +55,7 @@ Emitted whenever an observed mpv property changes on any pane.
   "event": "property-change",
   "pane": "wide-top",
   "property": "pause",
-  "data": true
+  "value": true
 }
 ```
 
@@ -63,15 +73,30 @@ Emitted whenever an observed mpv property changes on any pane.
 | `duration` | float | Total duration (seconds) |
 | `idle-active` | bool | True when playback ended |
 
-`idle-active: true` is the primary signal for playlist exhaustion and auto-advance triggers.
+`idle-active: true` signals that the current pane has finished playing and the playlist is exhausted.
 
 ### `online` / `offline`
 
 Emitted when a pane's mpv process comes up or goes down.
 
 ```json
-{ "event": "online", "pane": "wide-top" }
+{ "event": "online",  "pane": "wide-top" }
 { "event": "offline", "pane": "wide-top" }
+```
+
+### `node:playlist`
+
+Response to a `playlist-get` command.
+
+```json
+{
+  "event": "node:playlist",
+  "pane": "wide-top",
+  "items": [
+    { "filename": "https://...", "title": "Stalker" },
+    { "filename": "https://...", "title": "Andrei Rublev" }
+  ]
+}
 ```
 
 ---
@@ -103,18 +128,14 @@ Load a URL or file path into a pane.
 **Second arg options:**
 - `"replace"` — replace current playback immediately
 - `"append"` — append to playlist
-- `"append-play"` — append and play if nothing is playing
+- `"append-play"` — append and play if nothing is currently playing
 
 ### `stop`
 
 Stop playback on a pane.
 
 ```json
-{
-  "command": "stop",
-  "pane": "wide-top",
-  "args": []
-}
+{ "command": "stop", "pane": "wide-top", "args": [] }
 ```
 
 ### `set_property`
@@ -122,61 +143,50 @@ Stop playback on a pane.
 Set any mpv property on a pane.
 
 ```json
-{ "command": "set_property", "pane": "music", "args": ["volume", 60] }
-{ "command": "set_property", "pane": "wide-top", "args": ["pause", true] }
-{ "command": "set_property", "pane": "wide-top", "args": ["mute", false] }
+{ "command": "set_property", "pane": "music",    "args": ["volume", 60] }
+{ "command": "set_property", "pane": "wide-top", "args": ["pause",  true] }
+{ "command": "set_property", "pane": "wide-top", "args": ["mute",   false] }
 ```
 
 ### `keypress`
 
-Send a key event directly to mpv. Gives access to the full mpv keyboard surface.
+Send a key event directly to mpv. Exposes the full mpv keyboard surface to any client through a single command.
 
 ```json
 { "command": "keypress", "pane": "wide-top", "args": ["SPACE"] }
 { "command": "keypress", "pane": "wide-top", "args": ["RIGHT"] }
-{ "command": "keypress", "pane": "wide-top", "args": ["j"] }
 { "command": "keypress", "pane": "wide-top", "args": ["#"] }
 ```
 
-Any key that mpv recognizes in its `input.conf` works here. This includes:
+Any key mpv recognizes in its `input.conf` works here — including keys bound by user scripts. Common examples:
 
-- `SPACE` — toggle pause
-- `RIGHT` / `LEFT` — seek forward/backward 5s
-- `UP` / `DOWN` — seek forward/backward 1m
-- `9` / `0` — volume down/up
-- `m` — toggle mute
-- `f` — toggle fullscreen
-- `j` / `J` — cycle subtitle track
-- `#` — cycle audio track
-- `<` / `>` — previous/next playlist item
-- `l` — toggle loop
-- `s` — screenshot
-- Any key from the user's `input.conf`
+| Key | mpv action |
+|-----|------------|
+| `SPACE` | Toggle pause |
+| `RIGHT` / `LEFT` | Seek ±5s |
+| `UP` / `DOWN` | Seek ±60s |
+| `9` / `0` | Volume ±5 |
+| `m` | Toggle mute |
+| `f` | Toggle fullscreen |
+| `j` / `J` | Cycle subtitle track |
+| `#` | Cycle audio track |
+| `<` / `>` | Previous / next playlist item |
+| `l` | Toggle loop |
+| `s` | Screenshot |
 
 ### `playlist-get`
 
-Request the current playlist for a pane. Daemon responds with a `playlist` event.
+Request the current playlist for a pane.
 
 ```json
 { "command": "playlist-get", "pane": "wide-top", "args": [] }
 ```
 
-Response:
-
-```json
-{
-  "event": "playlist",
-  "pane": "wide-top",
-  "items": [
-    { "index": 0, "filename": "https://...", "title": "Stalker", "current": false },
-    { "index": 1, "filename": "https://...", "title": "Andrei Rublev", "current": true }
-  ]
-}
-```
+Daemon responds with a `node:playlist` event.
 
 ### `playlist-remove`
 
-Remove an item from the playlist by index.
+Remove an item by index.
 
 ```json
 { "command": "playlist-remove", "pane": "wide-top", "args": [2] }
@@ -184,7 +194,7 @@ Remove an item from the playlist by index.
 
 ### `playlist-move`
 
-Move a playlist item from one index to another.
+Move an item from one index to another.
 
 ```json
 { "command": "playlist-move", "pane": "wide-top", "args": [3, 1] }
@@ -194,17 +204,17 @@ Move a playlist item from one index to another.
 
 ## TLS
 
-The daemon generates a self-signed certificate at first run, stored at `~/.config/panebot/pb.crt` and `~/.config/panebot/pb.key`.
+The daemon generates a self-signed certificate at first run: `~/.config/panebot/pb.crt` and `~/.config/panebot/pb.key`.
 
-**TUI** — connects with certificate verification disabled (`NoCertVerification`). Appropriate for LAN use.
+**TUI** — connects with certificate verification disabled. Appropriate for LAN use.
 
-**Browser extension** — requires the certificate to be trusted in the browser. Visit `https://<node-ip>:9090` in the browser and accept the certificate. One-time setup per machine.
+**Browser extension** — requires the certificate to be trusted in the browser. Visit `https://<host>:9090` once per machine and accept the certificate.
 
-**Programmatic clients** — either disable verification (LAN) or trust the certificate explicitly.
+**Programmatic clients** — disable verification for LAN, or trust the certificate explicitly.
 
 ---
 
-## Node Management Commands (TBD)
+## Pane Management (TBD)
 
 These commands are implemented in the daemon but not yet exposed in the TUI.
 
@@ -223,13 +233,10 @@ Clone an existing pane — creates a new mpv instance copying the source pane's 
 
 ### `panebot:remove-pane`
 
-Remove a pane — kills mpv, removes from active pane list, updates config.
+Remove a pane — stops mpv, removes from active pane list, updates config.
 
 ```json
-{
-  "command": "panebot:remove-pane",
-  "pane": "wide-top-2"
-}
+{ "command": "panebot:remove-pane", "pane": "wide-top-2", "args": [] }
 ```
 
 ---
@@ -241,22 +248,24 @@ const ws = new WebSocket('wss://192.168.1.100:9090');
 
 ws.onmessage = (msg) => {
   const event = JSON.parse(msg.data);
+
   if (event.event === 'node:snapshot') {
-    console.log('Panes:', event.panes.map(p => p.name));
+    console.log('Connected. Panes:', event.panes.map(p => p.name));
   }
-  if (event.event === 'property-change' && event.property === 'idle-active' && event.data) {
+
+  if (event.event === 'property-change' && event.property === 'idle-active' && event.value) {
     console.log(`Pane ${event.pane} finished playing`);
   }
 };
 
-// Load a URL
+// Send a URL to a pane
 ws.send(JSON.stringify({
   command: 'loadfile',
   pane: 'wide-top',
   args: ['https://example.com/video.mp4', 'replace']
 }));
 
-// Toggle pause
+// Full mpv control via keypress
 ws.send(JSON.stringify({
   command: 'keypress',
   pane: 'wide-top',

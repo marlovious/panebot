@@ -2,8 +2,6 @@
 
 Distributed mpv orchestration system. Control multiple video panes across one or more machines from a terminal UI or browser extension. Built for media walls, unattended nodes, and anyone who wants real control over what's playing and where.
 
-![PaneBot Dashboard](assets/dashboard.png)
-
 [ [Concept](#concept) | [Use Cases](#use-cases) | [Architecture](#architecture) | [Quick Start](#quick-start) | [Configuration](#configuration) | [Key Bindings](#key-bindings) ]
 
 ---
@@ -61,7 +59,7 @@ Browser Extension
 Ratatui terminal UI. Connects to any daemon over WSS. Three-screen navigation:
 
 ```
-Log  ←[←/→]→  Panes  ←[←/→]→  Details (Playlist)
+Log  ←[h/l]→  Panes  ←[h/l]→  Details (Playlist)
 ```
 
 Pane state (playing, paused, stopped, volume, title) is updated live from the daemon. Command mode (`Tab`) gives direct mpv control — seek, volume, fullscreen, passthrough.
@@ -151,10 +149,14 @@ pb.panes.conf ──► mpv --playlist=music.m3u
 ### macOS
 
 ```bash
+# build
 git clone https://github.com/marlovious/panebot
-cd panebot
-cargo install --path panebot-daemon
-cargo install --path panebot-tui
+cd panebot/tui
+cargo build --release
+
+# install binaries
+cp target/release/panebot-daemon /usr/local/bin/
+cp target/release/panebot-tui    /usr/local/bin/
 
 # first run — bootstraps config, generates TLS cert, launches mpv panes
 panebot-daemon &
@@ -164,9 +166,9 @@ panebot-tui
 ### Linux (Hyprland + systemd)
 
 ```bash
-git clone https://github.com/marlovious/panebot
-cd panebot
-cargo install --path panebot-daemon
+# build
+cargo build --release
+sudo cp target/release/panebot-daemon /usr/local/bin/
 
 # enable as systemd user service
 systemctl --user enable --now panebot-daemon
@@ -237,8 +239,8 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` / `↑` / `↓` | Navigate panes |
-| `h` / `l` / `←` / `→` | Switch screen (Log ↔ Panes ↔ Details) |
+| `j` / `k` | Navigate panes |
+| `h` / `l` | Switch screen (Log ↔ Panes ↔ Details) |
 | `Tab` | Enter command mode |
 | `S` | Solo pane (mute others, fullscreen, play) |
 | `M` | Mute all others |
@@ -256,8 +258,8 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `Space` | Toggle pause |
 | `m` | Toggle mute |
 | `f` | Toggle fullscreen |
-| `h` / `l` / `←` / `→` | Seek ±5s |
-| `j` / `k` / `↑` / `↓` | Seek ±60s |
+| `h` / `l` | Seek ±5s |
+| `j` / `k` | Seek ±60s |
 | `9` / `0` | Volume ±5 |
 | `v` | Enter mpv passthrough |
 | `Tab` | Exit command mode |
@@ -266,7 +268,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` / `↑` / `↓` | Navigate items |
+| `j` / `k` | Navigate items |
 | `Enter` | Play now |
 | `n` | Queue next |
 | `Space` | Mark item |
@@ -277,7 +279,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `A` | Add URL or path |
 | `S` | Save playlist |
 | `G` | Jump to index |
-| `h` / `←` | Back to dashboard |
+| `h` | Back to dashboard |
 
 ### mpv Passthrough (`v`)
 
