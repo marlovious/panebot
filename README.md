@@ -4,7 +4,7 @@
 Multi-pane mpv controller with a terminal UI and browser extension. Run it locally, or run the daemon on any machine and control it from anywhere on your network.
 
 <div align="center">
-
+<br>
 [ [Concept](#concept) | [Use Cases](#use-cases) | [Design](#design) | [Quick Start](#quick-start) | [Reference](#reference) ]
 
 </div>
