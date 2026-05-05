@@ -1,25 +1,32 @@
 # PaneBot
 
-Distributed mpv orchestration system. Control multiple video panes across one or more machines from a terminal UI or browser extension. Built for media walls, unattended nodes, and anyone who wants real control over what's playing and where.
+Just the streams.
 
-[ [Concept](#concept) | [Use Cases](#use-cases) | [Architecture](#architecture) | [Quick Start](#quick-start) | [Configuration](#configuration) | [Key Bindings](#key-bindings) ]
+Multi-pane mpv controller with a terminal UI and browser extension. Run it locally, or run the daemon on any machine and control it from anywhere on your network.
+
+![PaneBot Dashboard](assets/dashboard.png)
+
+[ [Concept](#concept) | [Use Cases](#use-cases) | [How It Works](#how-it-works) | [Quick Start](#quick-start) | [Configuration](#configuration) | [Key Bindings](#key-bindings) ]
 
 ---
 
 ## Concept
 
-PaneBot doesn't care where your streams come from. Debrid, YouTube, RTMP, local files, clipboard URLs — it routes them to the right pane and gets out of the way.
+PaneBot manages mpv instances — one per pane. The daemon handles launching, monitoring, and IPC. The TUI controls them. The browser extension sends URLs directly to any pane from any tab.
 
-A node is a machine running `panebot-daemon`. Each daemon manages a set of mpv instances (panes), monitors their state over IPC, and serves a WebSocket API on port 9090. The TUI connects to any node on your LAN and gives you full control. The browser extension lets you send URLs from any tab directly to any pane on any node.
+Run `panebot-tui` and the daemon starts automatically. Define your panes, set your layouts, and you have the full mpv surface across as many windows as you want. Put the daemon in remote mode and it accepts connections over WSS — the TUI and extension behave identically whether the daemon is local or on a machine across the room.
+
+PaneBot doesn't duplicate mpv. It controls it. Every mpv feature, script, and config you already use works exactly as it does today.
 
 ```
 Browser Extension
+   (URL ingress)
       │
       │ wss://
       ▼
 ┌─────────────────────────────────────────────┐
 │  PaneBot Dashboard (panebot-tui)            │
-│  Terminal UI — connects to any node         │
+│  Terminal UI — connects to any daemon       │
 └────────────────┬────────────────────────────┘
                  │ wss://
         ┌────────┴────────┐
@@ -28,7 +35,7 @@ Browser Extension
 ┌──────────────┐   ┌──────────────┐
 │  PaneBot     │   │  PaneBot     │
 │  Daemon      │   │  Daemon      │
-│  (macOS)     │   │  (Linux)     │
+│  (local)     │   │  (remote)    │
 └──────┬───────┘   └──────┬───────┘
        │ IPC              │ IPC
   ┌────┴────┐        ┌────┴────┐
@@ -42,42 +49,43 @@ Browser Extension
 ## Use Cases
 
 - Multi-screen media walls and art installations
-- Unattended kiosk and digital signage nodes
 - Event and venue AV control from a single operator machine
-- Home theater with independent zone control
-- Broadcast monitoring — multiple live streams on one display
-- Personal media server with full remote playback control
-- Programmatic URL routing to screens from any client or script
-- Development and testing of mpv-based media pipelines
+- Broadcast and security feed monitoring across named panes
+- Remote machines running PaneBot, controlled over the network
+- Send any URL from a browser tab to any pane with one click
+- Development and testing of mpv-based pipelines and scripts
 
 ---
 
-## Architecture
+## How It Works
 
-### PaneBot Dashboard — `panebot-tui`
+### `panebot-tui`
 
 Ratatui terminal UI. Connects to any daemon over WSS. Three-screen navigation:
 
 ```
-Log  ←[h/l]→  Panes  ←[h/l]→  Details (Playlist)
+Log  ←[←/→]→  Panes  ←[←/→]→  Details (Playlist)
 ```
 
-Pane state (playing, paused, stopped, volume, title) is updated live from the daemon. Command mode (`Tab`) gives direct mpv control — seek, volume, fullscreen, passthrough.
+Pane state — playing, paused, volume, title, position — is updated live from the daemon. Command mode (`Tab`) passes input directly to mpv. Switch between daemons with `C`.
 
-### PaneBot Service — `panebot-daemon`
+### `panebot-daemon`
 
-Async Tokio WebSocket server (port 9090, WSS). One daemon per node. Manages:
+Async Tokio WebSocket server (port 9090, WSS). Manages mpv instances over Unix IPC sockets. Broadcasts typed events to all connected clients. Accepts commands — loadfile, playlist ops, layout switch, keypress passthrough, restart.
 
-- Launching and monitoring mpv instances over Unix sockets
-- Broadcasting typed events to all connected clients
-- Accepting commands (loadfile, playlist ops, layout switch, restart)
-- Serving its known host list so the TUI and extension can discover other nodes
+In `local` mode it binds to `127.0.0.1`. In `remote` mode it binds to `0.0.0.0` and accepts LAN connections. Self-signed TLS cert generated on first boot (`pb.crt`, `pb.key`).
 
-Self-signed TLS cert generated on first boot (`pb.crt`, `pb.key`). On Linux, runs as a systemd user service under `uwsm`.
+On Linux, the daemon can run as a systemd user service — see [panebot-node](#) for a reference deployment.
 
-### PaneBot Node OS — Linux
+### Browser Extension
 
-Cheap ThinkPad running Debian testing + Hyprland. The daemon starts with the session, panes spawn into the tiling layout in order, the display mirrors to HDMI. No desktop, no browser, no overhead — just streams.
+Adds a context menu item to any page. Right-click → Send to PaneBot → choose daemon and pane. The current tab URL loads immediately. Works with any URL mpv can open.
+
+Requires the daemon's self-signed certificate to be trusted in the browser — visit `https://host:9090` once per machine to accept it.
+
+### Protocol
+
+The daemon speaks a documented WebSocket protocol. Typed events flow out — `node:snapshot` on connect, `property-change` as state updates. Commands flow in. Any client that speaks JSON can connect to a daemon, receive live state, and send commands. The full protocol is documented in [`docs/protocol.md`](docs/protocol.md).
 
 ### Workspace
 
@@ -85,44 +93,17 @@ Cheap ThinkPad running Debian testing + Hyprland. The daemon starts with the ses
 panebot/
 ├── Cargo.toml              — workspace root
 ├── panebot-lib/            — shared types, config parsers, M3U utilities
-├── panebot-daemon/         — node daemon
-└── panebot-tui/            — terminal control interface
+├── panebot-daemon/         — daemon
+└── panebot-tui/            — terminal controller
 ```
 
-Binaries link statically. A node ships just `panebot-daemon`. A control machine ships just `panebot-tui`. No shared runtime required on target machines.
-
----
-
-## Directory Layout
-
-```
-~/.config/panebot/
-├── pb.panes.conf          # pane definitions + active layout
-├── pb.daemon.conf         # mode (local/remote) + known remote nodes
-├── pb.crt                 # TLS certificate (auto-generated)
-├── pb.key                 # TLS private key (auto-generated)
-├── pb.hypr.conf           # Hyprland window rules (sourced by hyprland.conf)
-├── panebot-daemon.log     # daemon log
-├── layouts/
-│   ├── pb.left.stack.layout
-│   └── pb.right.stack.layout
-├── music/
-│   ├── music.mpv.conf
-│   ├── music.m3u          # playlist — launch config and save target
-│   ├── music.sock         # mpv IPC socket
-│   └── scripts/
-├── wide-top/
-├── wide-bottom/
-└── standard/
-```
-
-Each pane gets its own directory named after its `mpv_name`. The `.mpv.conf` is written once by bootstrap and edited freely. The `.m3u` is the launch playlist — mpv loads it at startup, and the daemon can save the live playlist back to it.
+Binaries link statically. No shared runtime required.
 
 ---
 
 ## Playlists and Live State
 
-mpv is truth. The `.m3u` file is a launch config, not a live record. Once mpv is running, the daemon queries its IPC socket for the current playlist, track position, and state. The TUI reflects live mpv state — not what's on disk.
+mpv is truth. The `.m3u` file is a launch config, not a live record. Once mpv is running, the daemon queries its IPC socket for current state. The TUI reflects live mpv — not what's on disk.
 
 Saving a playlist (`S` in Details) queries mpv directly and writes the current live playlist back to any path you choose.
 
@@ -149,37 +130,63 @@ pb.panes.conf ──► mpv --playlist=music.m3u
 ### macOS
 
 ```bash
-# build
 git clone https://github.com/marlovious/panebot
-cd panebot/tui
-cargo build --release
+cd panebot
+cargo install --path panebot-daemon
+cargo install --path panebot-tui
 
-# install binaries
-cp target/release/panebot-daemon /usr/local/bin/
-cp target/release/panebot-tui    /usr/local/bin/
-
-# first run — bootstraps config, generates TLS cert, launches mpv panes
-panebot-daemon &
+# daemon starts automatically on first launch
 panebot-tui
 ```
 
-### Linux (Hyprland + systemd)
+### Linux
 
 ```bash
-# build
-cargo build --release
-sudo cp target/release/panebot-daemon /usr/local/bin/
+git clone https://github.com/marlovious/panebot
+cd panebot
+cargo install --path panebot-daemon
+cargo install --path panebot-tui
 
-# enable as systemd user service
-systemctl --user enable --now panebot-daemon
-
-# add to hyprland.conf
-echo "source = ~/.config/panebot/pb.hypr.conf" >> ~/.config/hypr/hyprland.conf
+# daemon starts automatically on first launch
+panebot-tui
 ```
 
-### Browser Extension
+On Linux, window placement is handled by your WM — panes spawn in the order defined in `pb.panes.conf` and you arrange them however you want. A Hyprland rules file is generated on bootstrap as a convenience.
 
-Load `tui/extension/` as an unpacked extension in Chrome or Brave. On first connection to each node, visit `https://nodeip:9090` in the browser to accept the self-signed certificate. Both the local node and any remote node must be trusted this way.
+To run the daemon as a systemd user service so it starts with your session:
+
+```bash
+systemctl --user enable --now panebot-daemon
+```
+
+For a dedicated remote display, see [panebot-node](#).
+
+---
+
+## Directory Layout
+
+```
+~/.config/panebot/
+├── pb.panes.conf          # pane definitions + active layout
+├── pb.daemon.conf         # mode (local/remote) + known remote daemons
+├── pb.crt                 # TLS certificate (auto-generated)
+├── pb.key                 # TLS private key (auto-generated)
+├── pb.hypr.conf           # Hyprland window rules (sourced by hyprland.conf)
+├── panebot-daemon.log     # daemon log
+├── layouts/
+│   ├── pb.left.stack.layout
+│   └── pb.right.stack.layout
+├── music/
+│   ├── music.mpv.conf
+│   ├── music.m3u          # playlist — launch config and save target
+│   ├── music.sock         # mpv IPC socket
+│   └── scripts/
+├── wide-top/
+├── wide-bottom/
+└── standard/
+```
+
+Each pane gets its own directory. The `.mpv.conf` is written once by bootstrap and edited freely. The `.m3u` is the launch playlist.
 
 ---
 
@@ -203,7 +210,7 @@ pane_name = Wide Bottom
 pane_name = Standard
 ```
 
-The section header (`music`, `wide-top`) is the `mpv_name` — permanent identifier that drives the directory, socket, and config file. `pane_name` is display only and can be changed freely.
+The section header is the `mpv_name` — permanent identifier that drives the directory, socket, and config file. `pane_name` is display only.
 
 ### `pb.daemon.conf`
 
@@ -213,7 +220,7 @@ The section header (`music`, `wide-top`) is the `mpv_name` — permanent identif
 
 mode = remote
 
-[linux-node]
+[remote-display]
 address = wss://192.168.1.x:9090
 ```
 
@@ -229,7 +236,7 @@ geometry = 366x366+0+0
 geometry = 650x366+0+374
 ```
 
-On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order drives Hyprland master layout placement.
+On macOS, geometry is passed as `--geometry` to mpv — PaneBot positions the windows. On Linux, geometry is ignored — panes spawn in order and window placement is managed by your WM. A Hyprland rules file (`pb.hypr.conf`) is generated on bootstrap as a convenience.
 
 ---
 
@@ -239,8 +246,8 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate panes |
-| `h` / `l` | Switch screen (Log ↔ Panes ↔ Details) |
+| `j` / `k` / `↑` / `↓` | Navigate panes |
+| `h` / `l` / `←` / `→` | Switch screen (Log ↔ Panes ↔ Details) |
 | `Tab` | Enter command mode |
 | `S` | Solo pane (mute others, fullscreen, play) |
 | `M` | Mute all others |
@@ -248,7 +255,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `r` | Restart selected pane |
 | `R` | Restart all panes |
 | `W` | Switch layout |
-| `C` | Connect to different node |
+| `C` | Connect to different daemon |
 | `q` | Quit |
 
 ### Command Mode (`Tab`)
@@ -258,8 +265,8 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `Space` | Toggle pause |
 | `m` | Toggle mute |
 | `f` | Toggle fullscreen |
-| `h` / `l` | Seek ±5s |
-| `j` / `k` | Seek ±60s |
+| `h` / `l` / `←` / `→` | Seek ±5s |
+| `j` / `k` / `↑` / `↓` | Seek ±60s |
 | `9` / `0` | Volume ±5 |
 | `v` | Enter mpv passthrough |
 | `Tab` | Exit command mode |
@@ -268,7 +275,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 
 | Key | Action |
 |-----|--------|
-| `j` / `k` | Navigate items |
+| `j` / `k` / `↑` / `↓` | Navigate items |
 | `Enter` | Play now |
 | `n` | Queue next |
 | `Space` | Mark item |
@@ -279,7 +286,7 @@ On macOS, geometry is passed as `--geometry` to mpv. On Linux, pane spawn order 
 | `A` | Add URL or path |
 | `S` | Save playlist |
 | `G` | Jump to index |
-| `h` | Back to dashboard |
+| `h` / `←` | Back to dashboard |
 
 ### mpv Passthrough (`v`)
 
@@ -291,8 +298,6 @@ All keys forward directly to mpv. Exit with `v`.
 
 - mpv
 - Rust (build only)
-- Hyprland (Linux node, optional)
-- uwsm (Linux systemd session, optional)
 
 ---
 
