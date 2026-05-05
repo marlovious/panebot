@@ -60,17 +60,9 @@ Browser Extension
 
 **`panebot-daemon`** — Async Tokio WebSocket server (port 9090, WSS). The only process that owns mpv. Spawns and monitors mpv instances over Unix IPC sockets, broadcasts typed events to all connected clients. In `local` mode binds to `127.0.0.1`; in `remote` mode binds to `0.0.0.0` and accepts LAN connections. Self-signed TLS cert generated on first boot (`pb.crt`, `pb.key`).
 
-**`panebot-tui`** — Ratatui terminal dashboard. Connects to any daemon over WSS. Three-screen navigation: `Log ←→ Panes ←→ Details`. Pane state — playing, paused, volume, title, position — updates live from the daemon. Command mode (`Tab`) passes input directly to mpv. Switch between daemons with `C`.
+**`panebot-tui`** — Ratatui terminal dashboard. Connects to any daemon over WSS. Three-screen navigation: `Log ←→ Panes ←→ Details (Playlist)`. Pane state — playing, paused, volume, title, position — updates live from the daemon. Command mode (`Tab`) passes input directly to mpv. Switch between daemons with `C`.
 
 **Browser extension** — Adds a context menu item to any page. Right-click → Send to PaneBot → choose daemon and pane. Works with any URL mpv can open.
-
-The daemon is the only process that owns mpv. The TUI, browser extension, and any other JSON client are peers — the daemon doesn't know or care which one it's talking to. Kill the TUI and reconnect — playback was never interrupted.
-
-State is event-driven end to end. The daemon subscribes to mpv property changes via `observe_property` — no polling anywhere in the stack. mpv pushes events; the daemon forwards them immediately to all connected clients. On connect, every client receives a full `node:snapshot` and is immediately synchronized.
-
-The full mpv keyboard surface is available through a single `keypress` passthrough command. No enumeration of mpv IPC operations, no protocol maintenance as mpv evolves. The daemon stays thin. mpv stays authoritative.
-
-The protocol is documented and open. Any client that speaks JSON can connect, receive live state, send commands, and respond to playback events — including `idle-active`, which fires the moment a pane finishes playing. There is no proprietary API. See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ```
 panebot/
@@ -80,7 +72,7 @@ panebot/
 └── panebot-tui/            — Ratatui terminal controller
 ```
 
-Binaries link statically. No shared runtime required.
+Binaries link statically. No shared runtime required. See [`docs/architecture.md`](docs/architecture.md) for the full design.
 
 ---
 
@@ -88,7 +80,7 @@ Binaries link statically. No shared runtime required.
 
 mpv is truth. The `.m3u` file is a launch config, not a live record. Once mpv is running, the daemon queries its IPC socket for current state. The TUI reflects live mpv — not what's on disk.
 
-Saving a playlist (`S` in Details) queries mpv directly and writes the current live playlist back to any path you choose.
+From the Details (Playlist) screen you can queue, delete, move, crop, search, and add items — and save the live playlist back to any path you choose (`S`).
 
 ```
 pb.panes.conf ──► mpv --playlist=music.m3u
@@ -234,7 +226,7 @@ On macOS, geometry is passed as `--geometry` to mpv — PaneBot positions the wi
 | Key | Action |
 |-----|--------|
 | `j` / `k` / `↑` / `↓` | Navigate panes |
-| `h` / `l` / `←` / `→` | Switch screen (Log ↔ Panes ↔ Details) |
+| `h` / `l` / `←` / `→` | Switch screen (Log ↔ Panes ↔ Details (Playlist)) |
 | `Tab` | Enter command mode |
 | `S` | Solo pane (mute others, fullscreen, play) |
 | `M` | Mute all others |

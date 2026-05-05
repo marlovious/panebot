@@ -24,7 +24,7 @@ daemon startup
 
 Property subscriptions are the core of the zero-polling model. Instead of asking mpv "are you paused?" on a timer, the daemon sends:
 
-```json
+```
 {"command": ["observe_property", 1, "pause"]}
 {"command": ["observe_property", 2, "volume"]}
 {"command": ["observe_property", 3, "media-title"]}
@@ -96,6 +96,8 @@ Panes are independent. One pane crashing does not affect others.
 
 Ratatui application running in a dedicated async task. Maintains a local `UiState` — the rendered view of what the daemon has reported. On connect it receives the snapshot. On each `property-change` it updates the relevant pane and schedules a redraw.
 
+`panebot-tui` presents three screens: **Log** (daemon and mpv event stream), **Panes** (live state across all panes — playback status, volume, title, position), and **Details (Playlist)** (full playlist management for the selected pane — queue, delete, move, crop, search, add URLs, save). Navigation between screens is `←/→`. Command Mode (`Tab`) passes keypresses directly to mpv for the selected pane.
+
 The TUI sends commands on keypress. It never reads from mpv directly. It is a view, not a controller in the ownership sense. It can be run locally or pointed at any daemon on the network — the experience is identical.
 
 ### Browser Extension
@@ -122,7 +124,7 @@ The `idle-active` event is particularly useful in this context. When a pane fini
 
 A daemon in remote mode is also a natural target for programmatic control. Automated playlist management, URL ingress from browser extensions or external systems, event-driven playback — all of this is first-class because the protocol is open and the daemon is stateless. There is no proprietary API to integrate against. There is a WebSocket endpoint and a documented protocol.
 
-For a reference deployment on dedicated display hardware, see [panebot-node](#).
+For a reference OS and hardware configuration for a dedicated headless display node, see [panebot-node](https://github.com/marlovious/panebot-node).
 
 ---
 
