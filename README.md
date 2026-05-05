@@ -1,11 +1,16 @@
-# <img src="assets/panebot.png" width="130" align="left" style="margin-right: 12px" /> PaneBot - Just the streams.
+<img src="assets/panebot.png" width="130" align="left" style="margin-right: 12px" /> PaneBot - Just the streams.
+
+<br>
 
 Multi-pane mpv controller with a terminal UI and browser extension. Run it locally, or run the daemon on any machine and control it from anywhere on your network.
 
-
-![PaneBot Dashboard](assets/dashboard.png)
+<div align="center">
 
 [ [Concept](#concept) | [Use Cases](#use-cases) | [Design](#design) | [Quick Start](#quick-start) | [Reference](#reference) ]
+
+</div>
+
+![PaneBot Dashboard](assets/dashboard.png)
 
 ---
 
