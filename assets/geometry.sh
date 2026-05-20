@@ -5,7 +5,7 @@
 
 LAYOUT_NAME="${1:-captured}"
 LAYOUT_DIR="$HOME/.config/panebot/layouts"
-PANES_CONF="$HOME/.config/panebot/panes.conf"
+PANES_CONF="$HOME/.config/panebot/pb.panes.conf"
 OUTPUT="$LAYOUT_DIR/$LAYOUT_NAME.layout"
 
 mkdir -p "$LAYOUT_DIR"
