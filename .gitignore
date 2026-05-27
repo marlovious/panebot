@@ -1,1 +1,8 @@
-tui/target/
+target/
+**/target/
+
+.DS_Store
+**/.DS_Store
+
+*.log
+*.tmp
