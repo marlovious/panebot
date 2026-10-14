@@ -1,7 +1,0 @@
-[workspace]
-members = [
-    "panebot-lib",
-    "panebot-daemon",
-    "panebot-tui",
-]
-resolver = "2"

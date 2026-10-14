@@ -1,0 +1,17 @@
+[package]
+name = "panebot"
+version = "0.2.0-beta.1"
+edition = "2024"
+description = "Terminal-native operator client for mpv-targets"
+license = "MIT"
+repository = "https://github.com/marlovious/panebot"
+readme = "README.md"
+
+[dependencies]
+crossterm = { version = "0.27", features = ["event-stream"] }
+futures-util = "0.3"
+mpv_targets = { git = "https://github.com/marlovious/mpv-targets.git", rev = "b1f1933d18ec7477de09503a3c627bdde88d7eab" }
+ratatui = "0.26"
+serde = { version = "1", features = ["derive"] }
+tokio = { version = "1", features = ["full"] }
+toml = "0.8"
