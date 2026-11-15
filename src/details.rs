@@ -441,19 +441,14 @@ impl Details {
         if query.is_empty() {
             return vec![];
         };
-        let terms = search_terms(query);
-        self.items
-            .iter()
-            .enumerate()
-            .filter(|(_, i)| {
-                let s = normalize(
-                    &format!("{} {}", i.title.as_deref().unwrap_or(""), i.filename).to_lowercase(),
-                );
-                terms.iter().all(|t| s.contains(t))
-            })
-            .map(|(i, _)| i)
-            .collect()
+        crate::search::matches(
+            query,
+            self.items
+                .iter()
+                .map(|item| format!("{} {}", item.title.as_deref().unwrap_or(""), item.filename)),
+        )
     }
+
     fn select_match(&mut self, n: usize) {
         if matches!(&self.mode,Mode::Search{query,..} if query.is_empty()) {
             self.status = None;
@@ -700,43 +695,6 @@ fn channel_name(value: &str) -> Option<String> {
     } else {
         Some(format!("{v}.m3u"))
     }
-}
-fn search_terms(q: &str) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut current = String::new();
-    let mut quoted = false;
-    for c in q.to_lowercase().chars() {
-        match c {
-            '"' => {
-                if quoted && !current.trim().is_empty() {
-                    terms.push(normalize(&current));
-                    current.clear();
-                }
-                quoted = !quoted;
-            }
-            c if c.is_whitespace() && !quoted => {
-                if !current.trim().is_empty() {
-                    terms.push(normalize(&current));
-                    current.clear();
-                }
-            }
-            c => current.push(c),
-        }
-    }
-    if !current.trim().is_empty() {
-        terms.push(normalize(&current));
-    }
-    terms.into_iter().filter(|term| !term.is_empty()).collect()
-}
-
-fn normalize(value: &str) -> String {
-    value
-        .chars()
-        .map(|c| if c.is_ascii_punctuation() { ' ' } else { c })
-        .collect::<String>()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 pub fn loop_enabled(value: Option<&str>) -> bool {

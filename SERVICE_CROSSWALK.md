@@ -117,6 +117,7 @@ public boundary.
 | Mute Others | typed mute in display order | Available; client composition |
 | Pause/Play All | select from snapshot, typed pause/play | Available; client composition |
 | Toggle pause/mute | typed toggle methods | Available |
+| Command-mode audio/subtitle cycle | `TargetClient::cycle_audio` / `cycle_subtitle` | Available; `a` / `s` |
 | Seek | typed relative seek | Available |
 | Fullscreen | typed fullscreen toggle | Available |
 | Volume +/-5 | typed relative-volume helper | Available |

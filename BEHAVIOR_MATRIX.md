@@ -349,3 +349,60 @@ The public-client exercise used an isolated localhost daemon and headless mpv
 with temporary files, not deployed targets. Direct interactive comparison with
 the old production client and a real remote host was not performed in this pass;
 buffer equality is not a claim of complete production UI parity.
+
+### Approved channel Search (November 14, 2026)
+
+The user approved reusing playlist Search in both channel pickers. Production
+reference: `main:.../panebot-tui/src/main.rs` Details search renderer and handler
+(lines 620–665 and 917–944): `/`, incremental matching, white matches, Enter
+keeps selection, Esc cancels. The current approved Details adds AND/quoted
+terms, bracket navigation, and restoring selection on cancel. Channel pickers
+reuse that matcher and exact contextual footer; existing numbering, vertical
+viewport, row geometry, and channel workflows remain. Search is client-owned
+over the existing typed channel catalog; no new service calls or operations.
+This supersedes the earlier “no search” ruling above.
+
+The existing two-picker state/buffer regression now exercises query digits,
+match navigation, narrow scrolling, cancellation, Enter without assignment,
+Backspace, and no matches. Existing playlist search tests cover the shared
+matcher. Direct terminal review and live channel assignment for this addition
+remain unperformed; automated checks do not establish visual parity.
+
+### Approved command-mode track cycling (November 14, 2026)
+
+The user approved `a` for audio and `s` for subtitle cycling in Dashboard
+command mode. Production renderer `footer_dashboard_cmd` and Dashboard command
+handler (`main` at `49d6190`) have neither control; preserve the existing seek,
+volume, fullscreen, and mode keys. Add `[a] Audio [s] Subs` to the existing
+command footer with its existing colors and spacing conventions. Passthrough
+continues forwarding literal keys to mpv; normal Dashboard is unaffected.
+
+Both actions use existing typed `cycle_audio` / `cycle_subtitle` methods in the
+pinned public client, retaining correlated error/result handling. No service or
+dependency change. Existing input tests cover both bindings and mode isolation;
+the fixed-size command buffer checks the new hints and preserved colors.
+Direct terminal review and live multi-track playback validation remain pending.
+
+Approved compact Set Channel picker: remove the redundant `Select Channel`
+question row while Picking, giving its row to the scrolling list. Keep the
+Set Channel/target heading, loading text, restart question, and footer. Existing
+two-picker buffer coverage verifies first-row placement and resized scrolling.
+Direct terminal review of this spacing adjustment remains pending.
+
+### Approved shared playback command mode (November 14, 2026)
+
+The user requested Tab command mode throughout the connected UI, with lifecycle
+actions left in their existing menu. This supersedes Dashboard-only command
+mode. Production Details command handling and `footer_details_cmd` already
+provide playback controls; reuse the rewrite's existing command interpreter,
+service adapter, and mode footer instead of another handler. The underlying
+Details, channel/action menu, or prompt stays intact; command input takes
+precedence until Tab closes it. Passthrough remains available via backslash.
+No target exists in the connection/node picker, so those views are unchanged.
+
+Details uses existing command/passthrough row colors and footer, including
+correlated command errors. Entry is blocked while operations or Details loading/
+edits are pending. Paste cannot alter a suspended Details prompt. Existing
+Details and both-channel-picker state/buffer checks now verify Tab entry/exit,
+footer/row colors, typed audio action, passthrough, preserved selections, and
+lifecycle-key isolation. Live terminal comparison remains pending.

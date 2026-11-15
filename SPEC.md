@@ -313,8 +313,14 @@ without redesigning the screen.
 
 ### 9.5 Command mode and mpv passthrough
 
-Command mode and mpv passthrough exist on the Dashboard only. Details never
-enters either mode; the operator returns to Dashboard for playback control.
+Approved: Tab opens playback command mode throughout the connected UI,
+including Details and open menus/prompts, and Tab closes command mode to resume
+the same underlying screen and selection. Reuse the same interpreter, typed
+operations, passthrough transition, and footer; text-entry and lifecycle keys
+underneath are suspended while command mode is active. Entry remains blocked
+during an outstanding operation or Details load/edit and requires a controllable
+target. The node picker/connecting view has no target to control. Lifecycle
+commands remain confined to their existing Dashboard menu.
 Dashboard command mode provides this required visual treatment and controls:
 
 - Space toggles pause;
@@ -324,6 +330,8 @@ Dashboard command mode provides this required visual treatment and controls:
 - `h/l` or Left/Right seek -/+5 seconds;
 - `j/k` or Down/Up seek -/+60 seconds exactly as production maps them;
 - `9/0` change volume -/+5;
+- `a` cycles audio tracks and `s` cycles subtitle tracks through the typed
+  service methods (approved addition);
 - `\` enters passthrough;
 - Tab exits command mode.
 
@@ -580,8 +588,17 @@ selection aliases. Enter performs the selected action; only Esc closes the
 menu. Scroll the line horizontally as needed to reveal the selected option.
 The visible duplicate action and prompt title are `Duplicate`.
 
-Channel pickers remain vertical with `j`/`k`, Up/Down, Enter, and Esc, without
-search. Shared vertical lists (targets, nodes, channels, creation-mode choices)
+The Set Channel picker omits the redundant `Select Channel` line and gives
+that row to the list; loading and restart prompts retain their own line.
+Channel pickers remain vertical with `j`/`k`, Up/Down, Enter, and Esc.
+Approved channel Search reuses the playlist matcher and footer: `/` opens an
+incremental, case-insensitive search with AND terms and quoted phrases; `[`/`]`
+navigate matches, Enter closes search with the match highlighted, and Esc
+restores the prior selection. Search keeps all numbered rows visible and
+highlights matches, as Details does. Query characters (including digits and
+`j`/`k`) never trigger picker shortcuts. An additional Enter outside Search
+continues the existing channel workflow. Both Set Channel and New Target use
+the same implementation; no service requests are added. Shared vertical lists (targets, nodes, channels, creation-mode choices)
 use the playlist's centered selection-following viewport, clamped at the ends.
 Creation-mode menus also use Esc alone for Back; h/Left do not close them.
 

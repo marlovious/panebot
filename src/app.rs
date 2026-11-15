@@ -138,6 +138,7 @@ pub struct NewTargetPrompt {
     pub input: String,
     pub stage: NewTargetStage,
     pub channels: Vec<String>,
+    pub search: crate::search::ChannelSearch,
     pub channel: Option<String>,
     pub selected: usize,
     pub play_on_start: bool,
@@ -158,6 +159,7 @@ pub enum ChannelStage {
 pub struct ChannelPrompt {
     pub target: String,
     pub channels: Vec<String>,
+    pub search: crate::search::ChannelSearch,
     pub selected: usize,
     pub channel: Option<String>,
     pub restart_available: bool,
@@ -262,6 +264,27 @@ impl App {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Option<Effect> {
+        if matches!(self.view, View::Connected { .. }) {
+            if self.input_mode != Mode::Normal {
+                return self.handle_command_key(key);
+            }
+            if key.code == KeyCode::Tab {
+                if self.is_busy() || self.details.as_ref().is_some_and(|d| d.is_busy()) {
+                    return None;
+                }
+                let target = self.selected_target()?;
+                if target_is_controllable(target) {
+                    self.input_mode = Mode::Command;
+                    self.status = None;
+                } else {
+                    self.complete_action(Err(format!(
+                        "{} is not available for playback control",
+                        target.name.to_uppercase()
+                    )));
+                }
+                return None;
+            }
+        }
         if self.details.is_some() {
             return self.handle_details_key(key);
         }
@@ -298,9 +321,6 @@ impl App {
                 }
                 _ => None,
             },
-            View::Connected { .. } if self.input_mode != Mode::Normal => {
-                self.handle_command_key(key)
-            }
             View::Connected { .. } if self.management_prompt.is_some() => {
                 self.handle_management_key(key)
             }
@@ -339,22 +359,6 @@ impl App {
                         self.status = None;
                         None
                     }
-                    KeyCode::Tab => {
-                        if self.is_busy() {
-                            return None;
-                        }
-                        let target = self.selected_target()?;
-                        if target_is_controllable(target) {
-                            self.input_mode = Mode::Command;
-                            self.status = None;
-                        } else {
-                            self.complete_action(Err(format!(
-                                "{} is not available for playback control",
-                                target.name.to_uppercase()
-                            )));
-                        }
-                        None
-                    }
                     KeyCode::Char('S') => self.solo(),
                     KeyCode::Char('P') => self.toggle_all(),
                     KeyCode::Char('I') if !self.is_busy() => {
@@ -368,6 +372,7 @@ impl App {
                             input: String::new(),
                             stage: NewTargetStage::Name,
                             channels: Vec::new(),
+                            search: Default::default(),
                             channel: None,
                             selected: 0,
                             play_on_start: false,
@@ -400,6 +405,9 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, value: String) {
+        if self.input_mode != Mode::Normal {
+            return;
+        }
         if let Some(details) = self.details.as_mut() {
             details.paste(value);
         }
@@ -707,6 +715,13 @@ impl App {
         if prompt.busy {
             return None;
         }
+        if prompt.stage == ChannelStage::Picking
+            && prompt
+                .search
+                .handle(key.code, &prompt.channels, &mut prompt.selected)
+        {
+            return None;
+        }
         match prompt.stage {
             ChannelStage::Loading => match key.code {
                 KeyCode::Esc => {
@@ -781,6 +796,13 @@ impl App {
     fn handle_new_target_key(&mut self, key: KeyEvent) -> Option<Effect> {
         let prompt = self.new_target_prompt.as_mut()?;
         if prompt.busy {
+            return None;
+        }
+        if prompt.stage == NewTargetStage::ChannelPicker
+            && prompt
+                .search
+                .handle(key.code, &prompt.channels, &mut prompt.selected)
+        {
             return None;
         }
         match prompt.stage {
@@ -991,6 +1013,7 @@ impl App {
                         self.channel_prompt = Some(ChannelPrompt {
                             target,
                             channels: Vec::new(),
+                            search: Default::default(),
                             selected: 0,
                             channel: None,
                             restart_available,
@@ -1789,6 +1812,7 @@ mod tests {
             input: "monkey".into(),
             stage: NewTargetStage::ChannelPicker,
             channels: vec!["one.m3u".into(), "two.m3u".into()],
+            search: Default::default(),
             channel: None,
             selected: 0,
             play_on_start: false,

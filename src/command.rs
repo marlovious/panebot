@@ -12,6 +12,8 @@ pub enum Mode {
 pub enum Action {
     TogglePlay,
     ToggleMute,
+    CycleAudio,
+    CycleSubtitle,
     Keypress(String),
     ToggleFullscreen,
     Seek(f64),
@@ -32,6 +34,8 @@ pub fn interpret(mode: Mode, key: KeyEvent) -> Option<Input> {
         Mode::Command => match key.code {
             KeyCode::Char(' ') => Some(Input::Run(Action::TogglePlay)),
             KeyCode::Char('m') => Some(Input::Run(Action::ToggleMute)),
+            KeyCode::Char('a') => Some(Input::Run(Action::CycleAudio)),
+            KeyCode::Char('s') => Some(Input::Run(Action::CycleSubtitle)),
             KeyCode::Enter => Some(Input::Run(Action::Keypress("ENTER".into()))),
             KeyCode::Char('f') => Some(Input::Run(Action::ToggleFullscreen)),
             KeyCode::Left | KeyCode::Char('h') => Some(Input::Run(Action::Seek(-5.0))),
@@ -112,6 +116,15 @@ mod tests {
 
     #[test]
     fn production_seek_directions_are_preserved() {
+        for (character, action) in [('a', Action::CycleAudio), ('s', Action::CycleSubtitle)] {
+            let key = KeyEvent::new(KeyCode::Char(character), KeyModifiers::NONE);
+            assert_eq!(interpret(Mode::Command, key), Some(Input::Run(action)));
+            assert_eq!(interpret(Mode::Normal, key), None);
+            assert_eq!(
+                interpret(Mode::Passthrough, key),
+                Some(Input::Run(Action::Keypress(character.to_string())))
+            );
+        }
         let down = KeyEvent::new(KeyCode::Down, KeyModifiers::NONE);
         let up = KeyEvent::new(KeyCode::Up, KeyModifiers::NONE);
         assert_eq!(

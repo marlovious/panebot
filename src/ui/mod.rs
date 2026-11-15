@@ -274,23 +274,34 @@ fn dashboard_footer(app: &App) -> Line<'static> {
         ));
     }
     if let Some(p) = &app.channel_prompt {
+        if p.stage == ChannelStage::Picking
+            && let Some(query) = &p.search.query
+        {
+            return channel_search_footer(query, &p.channels, p.selected);
+        }
         return Line::from(Span::styled(
             if p.busy || p.stage == ChannelStage::Loading {
                 "Please wait"
             } else if p.stage == ChannelStage::Restart {
                 "[y] Restart Now :: [n/Enter] Set Without Restart :: [Esc] Back"
             } else {
-                "[j/k] Select :: [Enter] Set :: [Esc] Back"
+                "[/] Search :: [j/k] Select :: [Enter] Set :: [Esc] Back"
             },
             Style::default().fg(DIM),
         ));
     }
     if let Some(p) = &app.new_target_prompt {
+        if p.stage == NewTargetStage::ChannelPicker
+            && let Some(query) = &p.search.query
+        {
+            return channel_search_footer(query, &p.channels, p.selected);
+        }
         return Line::from(Span::styled(
             match p.stage {
-                NewTargetStage::ChannelPicker | NewTargetStage::ChoosingMode => {
-                    "[j/k] Select :: [Enter] Continue :: [Esc] Back"
+                NewTargetStage::ChannelPicker => {
+                    "[/] Search :: [j/k] Select :: [Enter] Continue :: [Esc] Back"
                 }
+                NewTargetStage::ChoosingMode => "[j/k] Select :: [Enter] Continue :: [Esc] Back",
                 NewTargetStage::LoadingChannels => "Please wait",
                 NewTargetStage::Confirming => "[y] Confirm :: [n/Enter/Esc] Cancel",
                 _ => "[Enter] Continue :: [Esc] Back",
@@ -304,6 +315,13 @@ fn dashboard_footer(app: &App) -> Line<'static> {
     ))
 }
 
+fn channel_search_footer(query: &str, channels: &[String], selected: usize) -> Line<'static> {
+    Line::from(Span::styled(
+        crate::search::footer(query, &crate::search::matches(query, channels), selected),
+        Style::default().fg(WHITE),
+    ))
+}
+
 fn render_channel_prompt(
     frame: &mut Frame<'_>,
     area: ratatui::layout::Rect,
@@ -311,7 +329,7 @@ fn render_channel_prompt(
 ) {
     let areas = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Length(1),
-        ratatui::layout::Constraint::Length(1),
+        ratatui::layout::Constraint::Length(u16::from(prompt.stage != ChannelStage::Picking)),
         ratatui::layout::Constraint::Min(1),
     ])
     .split(area);
@@ -328,11 +346,15 @@ fn render_channel_prompt(
     );
     let question = match prompt.stage {
         ChannelStage::Loading => "Loading channels…".to_owned(),
-        ChannelStage::Picking => "Select Channel".to_owned(),
+        ChannelStage::Picking => String::new(),
         ChannelStage::Restart => "Restart Now? [y/N]".to_owned(),
     };
     frame.render_widget(Paragraph::new(question), areas[1]);
     if prompt.stage == ChannelStage::Picking {
+        let matches = crate::search::matches(
+            prompt.search.query.as_deref().unwrap_or(""),
+            &prompt.channels,
+        );
         selectable_list(
             frame,
             areas[2],
@@ -356,7 +378,7 @@ fn render_channel_prompt(
                                 index + 1,
                                 mpv_targets::channel_display_name(channel)
                             ),
-                            index == prompt.selected,
+                            index == prompt.selected || matches.contains(&index),
                         ),
                     ])
                 })
@@ -485,7 +507,11 @@ fn render_details(frame: &mut Frame<'_>, app: &App, details: &crate::details::De
                 ),
             ])
             .style(if selected {
-                Style::default().bg(SELECTED)
+                Style::default().bg(match app.input_mode {
+                    Mode::Command => COMMAND_BG,
+                    Mode::Passthrough => MPV_ROW_BG,
+                    Mode::Normal => SELECTED,
+                })
             } else {
                 Style::default()
             })
@@ -493,10 +519,18 @@ fn render_details(frame: &mut Frame<'_>, app: &App, details: &crate::details::De
         .collect();
     frame.render_widget(ratatui::widgets::List::new(lines), rows[2]);
     divider(frame, rows[3]);
-    frame.render_widget(
-        Paragraph::new(details_footer(details, target, &matches)),
-        rows[4],
-    );
+    if app.input_mode != Mode::Normal {
+        if let Some(status) = &app.status {
+            render_status(frame, rows[4], status);
+        } else {
+            render_mode_footer(frame, rows[4], app.input_mode);
+        }
+    } else {
+        frame.render_widget(
+            Paragraph::new(details_footer(details, target, &matches)),
+            rows[4],
+        );
+    }
 }
 
 fn clock(seconds: f64) -> String {
@@ -571,18 +605,7 @@ fn details_footer(
         Mode::Search { query, .. } => {
             let m = matches;
             Line::from(Span::styled(
-                if query.is_empty() {
-                    "/ :: [Enter/Esc] Cancel".into()
-                } else if m.is_empty() {
-                    format!("/{} :: No matches :: [Enter/Esc] Cancel", tail(query, 60))
-                } else {
-                    format!(
-                        "/{} :: Match {}/{} :: [[/]] Navigate [Enter] Select [Esc] Cancel",
-                        tail(query, 50),
-                        m.iter().position(|i| *i == d.selected).unwrap_or(0) + 1,
-                        m.len()
-                    )
-                },
+                crate::search::footer(query, m, d.selected),
                 Style::default().fg(WHITE),
             ))
         }
@@ -674,6 +697,10 @@ fn render_new_target_prompt(
     }
 
     if prompt.stage == NewTargetStage::ChannelPicker {
+        let matches = crate::search::matches(
+            prompt.search.query.as_deref().unwrap_or(""),
+            &prompt.channels,
+        );
         selectable_list(
             frame,
             body_area,
@@ -697,7 +724,7 @@ fn render_new_target_prompt(
                                 index + 1,
                                 mpv_targets::channel_display_name(channel)
                             ),
-                            index == prompt.selected,
+                            index == prompt.selected || matches.contains(&index),
                         ),
                     ])
                 })
@@ -887,7 +914,7 @@ fn render_mode_footer(frame: &mut Frame<'_>, area: ratatui::layout::Rect, mode: 
                 Span::styled("[CMD]", Style::default().add_modifier(Modifier::BOLD)),
                 separator(),
                 Span::raw(
-                    "[Space] Pause [m] Mute [h/l] ±5s [j/k] ±60s [9/0] Vol [f] Full [\\] Adv [Tab] Close",
+                    "[Space] Pause [m] Mute [h/l] ±5s [j/k] ±60s [9/0] Vol [a] Audio [s] Subs [f] Full [\\] Adv [Tab] Close",
                 ),
             ]),
             Style::default().bg(COMMAND_BG).fg(COMMAND_FG),
@@ -1214,6 +1241,7 @@ mod tests {
                     input: "new".into(),
                     stage: NewTargetStage::ChannelPicker,
                     channels: channels.clone(),
+                    search: Default::default(),
                     channel: None,
                     selected: 0,
                     play_on_start: false,
@@ -1226,6 +1254,7 @@ mod tests {
                 app.channel_prompt = Some(ChannelPrompt {
                     target: "daily".into(),
                     channels: channels.clone(),
+                    search: Default::default(),
                     selected: 0,
                     channel: None,
                     restart_available: true,
@@ -1234,27 +1263,80 @@ mod tests {
                     busy: false,
                 });
             }
+            let selected_row = if creating { 6 } else { 5 };
+            let narrow_row = if creating { 5 } else { 4 };
+            let first_row = if creating { 4 } else { 3 };
             for _ in 0..9 {
                 app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
             }
             assert_eq!(
-                rendered_lines(&app, 40, 10)[6].trim_end(),
+                rendered_lines(&app, 40, 10)[selected_row].trim_end(),
                 ":: 10. channel9.m3u"
             );
             assert_eq!(
-                rendered_lines(&app, 40, 8)[5].trim_end(),
+                rendered_lines(&app, 40, 8)[narrow_row].trim_end(),
                 ":: 10. channel9.m3u"
             );
             let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
             terminal.draw(|frame| render(frame, &app)).unwrap();
-            assert_eq!(terminal.backend().buffer().get(0, 6).bg, SELECTED);
+            assert_eq!(
+                terminal.backend().buffer().get(0, selected_row as u16).bg,
+                SELECTED
+            );
             for _ in 0..9 {
                 app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
             }
             assert_eq!(
-                rendered_lines(&app, 40, 10)[4].trim_end(),
+                rendered_lines(&app, 40, 10)[first_row].trim_end(),
                 ":: 1. channel0.m3u"
             );
+            let press = |app: &mut App, code| {
+                assert_eq!(
+                    app.handle_key(KeyEvent::new(code, KeyModifiers::NONE)),
+                    None
+                );
+            };
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(app.input_mode, Mode::Command);
+            assert!(rendered_lines(&app, 120, 10)[9].contains("[CMD]"));
+            assert!(
+                app.handle_key(KeyEvent::new(KeyCode::Char('S'), KeyModifiers::NONE))
+                    .is_none()
+            );
+            press(&mut app, KeyCode::Tab);
+            assert_eq!(
+                rendered_lines(&app, 40, 10)[first_row].trim_end(),
+                ":: 1. channel0.m3u"
+            );
+            press(&mut app, KeyCode::Char('/'));
+            for c in "channel1".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            let lines = rendered_lines(&app, 100, 10);
+            assert_eq!(
+                lines[9].trim_end(),
+                "/channel1 :: Match 1/3 :: [[/]] Navigate [Enter] Select [Esc] Cancel"
+            );
+            press(&mut app, KeyCode::Char(']'));
+            assert!(rendered_lines(&app, 40, 8)[narrow_row].contains("11. channel10.m3u"));
+            press(&mut app, KeyCode::Char('['));
+            press(&mut app, KeyCode::Esc);
+            assert_eq!(
+                rendered_lines(&app, 40, 10)[first_row].trim_end(),
+                ":: 1. channel0.m3u"
+            );
+            press(&mut app, KeyCode::Char('/'));
+            for c in "channel9".chars() {
+                press(&mut app, KeyCode::Char(c));
+            }
+            press(&mut app, KeyCode::Enter); // Select only; never assign while searching.
+            assert!(rendered_lines(&app, 40, 8)[narrow_row].contains("10. channel9.m3u"));
+            press(&mut app, KeyCode::Char('/'));
+            press(&mut app, KeyCode::Char('x'));
+            assert!(rendered_lines(&app, 100, 10)[9].contains("No matches"));
+            press(&mut app, KeyCode::Backspace);
+            press(&mut app, KeyCode::Enter);
+            assert!(rendered_lines(&app, 40, 8)[narrow_row].contains("10. channel9.m3u"));
         }
     }
 
@@ -1365,6 +1447,7 @@ mod tests {
         let lines = rendered_lines(&app, 110, 8);
         assert!(lines[2].contains("[CMD]"));
         assert!(lines[7].contains("[Space] Pause"));
+        assert!(lines[7].contains("[a] Audio [s] Subs"));
         assert!(lines[7].contains("[\\] Adv [Tab] Close"));
 
         let mut terminal = Terminal::new(TestBackend::new(110, 8)).unwrap();
@@ -1418,6 +1501,34 @@ mod tests {
         assert_eq!(lines[3].trim_end(), "• 1    :: Beta");
         assert!(lines[7].contains("[Enter] Play/Next"));
         assert!(!lines[7].contains("[CMD]"));
+        let original = app.details.clone();
+        let press = |app: &mut App, code| {
+            app.handle_key(crossterm::event::KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            ))
+        };
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        assert!(rendered_lines(&app, 120, 8)[7].contains("[CMD]"));
+        let mut terminal = Terminal::new(TestBackend::new(120, 8)).unwrap();
+        terminal.draw(|frame| render(frame, &app)).unwrap();
+        assert_eq!(terminal.backend().buffer().get(0, 3).bg, COMMAND_BG);
+        assert_eq!(
+            press(&mut app, crossterm::event::KeyCode::Char('a')),
+            Some(crate::app::Effect::Run(
+                crate::app::DashboardAction::Command {
+                    target: "daily".into(),
+                    action: crate::command::Action::CycleAudio,
+                }
+            ))
+        );
+        app.complete_action(Ok("done".into()));
+        press(&mut app, crossterm::event::KeyCode::Char('\\'));
+        assert!(rendered_lines(&app, 120, 8)[7].contains("[MPV]"));
+        press(&mut app, crossterm::event::KeyCode::Char('\\'));
+        press(&mut app, crossterm::event::KeyCode::Tab);
+        assert_eq!(app.details, original);
+        assert_eq!(rendered_lines(&app, 120, 8), lines);
     }
 
     #[test]
@@ -1427,6 +1538,7 @@ mod tests {
             input: "monkey".into(),
             stage: NewTargetStage::PlayQuestion,
             channels: vec![],
+            search: Default::default(),
             channel: None,
             selected: 0,
             play_on_start: false,

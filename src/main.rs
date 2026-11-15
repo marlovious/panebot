@@ -1,6 +1,7 @@
 mod app;
 mod command;
 mod details;
+mod search;
 mod service;
 mod ui;
 

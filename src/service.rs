@@ -386,6 +386,8 @@ async fn execute_dashboard_action(
             match action {
                 command::Action::TogglePlay => target_client.toggle_play().await,
                 command::Action::ToggleMute => target_client.toggle_mute().await,
+                command::Action::CycleAudio => target_client.cycle_audio().await,
+                command::Action::CycleSubtitle => target_client.cycle_subtitle().await,
                 command::Action::Keypress(key) => target_client.keypress(key).await,
                 command::Action::ToggleFullscreen => target_client.fullscreen().await,
                 command::Action::Seek(seconds) => target_client.seek(seconds).await,
