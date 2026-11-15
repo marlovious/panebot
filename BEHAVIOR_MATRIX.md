@@ -166,15 +166,29 @@ functional continuity is.
 
 ### Approved Dashboard action semantics
 
+Identify addition (November 12): the user approved uppercase `I` on normal
+Dashboard to identify all online targets on the current node. Production
+Dashboard has no Identify binding; this specifically approved addition matches
+the public `targets identify` command: uppercase names, ASS font size 50,
+4,000 ms, typed `show_text`, snapshot order, first error stops. It uses the
+existing busy/result footer and adds `[I] Identify` to the idle hints. No new
+service operation or persistent target change. State coverage checks modal
+precedence and duplicate suppression; the existing Dashboard buffer verifies
+the footer hint. The adapter also passed an isolated live daemon/headless-mpv
+exercise through the public client. Visible OSD appearance remains for direct
+operator review; the formatting matches the `targets` implementation exactly.
+
 `Enter` opens a contextual action picker for the selected target. Disabled
 targets offer Enable and Enable & Start; intentionally stopped targets offer
 Start, Disable, Rename, and Remove; enabled offline and online targets offer
 Restart, Stop, and Disable. Every selected target then offers Set Channel and
-Duplicate as New. Set Channel uses the numbered public channel catalog picker;
+Duplicate. Set Channel uses the numbered public channel catalog picker;
 an online running target asks `Restart Now? [y/N]`, while Disabled, Stopped,
-and Offline targets assign without a restart question. The picker uses `j`/`k`
-or arrows, `Enter` performs the action, and `Esc`,
-`h`, or Left closes it without changing Dashboard selection. Opening the
+and Offline targets assign without a restart question. Target Actions is one
+horizontal line: `h`/`l` or Left/Right selects without wrapping, Enter performs
+the action, and only Esc closes it without changing Dashboard selection.
+The previous `j`/`k` and Up/Down selection keys remain aliases. The line scrolls
+to reveal the selected action when it exceeds the terminal width. Opening the
 picker clears stale action feedback so its contextual footer remains the
 bottom line.
 
@@ -188,7 +202,7 @@ identity selected after the authoritative topology snapshot arrives.
 
 Remove is offered only for an intentionally stopped target and requires
 `Remove "TARGET" and its target files? [y/N]` confirmation before the typed
-remove operation. Duplicate as New is available for every selected target,
+remove operation. Duplicate is available for every selected target,
 collects and validates a new name, and uses that selected target as the public
 `add(from)` source. It then offers Create: Disabled, Create: Enabled/Stopped,
 and Create: Enabled/Start; the last option enables through `add` and awaits
@@ -256,6 +270,42 @@ plain `v`, and reserves plain `\` to return to command mode. This deliberate
 difference preserves mpv's default subtitle-visibility key; stock mpv has no
 default `\` binding.
 
+### Approved compact menus and scrolling (November 10, 2026)
+
+Inline presentation (November 12): after direct use, the user approved keeping
+actions within the selected target row. Keep the rest of the Dashboard list
+visible and keep existing full-body
+channel pickers/follow-up prompts. No input or service behavior changes. The
+selected-row orange cursor, target name and teal background are retained;
+horizontal option scrolling uses the remaining row width. Existing action
+input tests and fixed buffers cover inline actions, narrow views, unchanged other
+rows, and restoration of the Dashboard when Esc closes the actions.
+The user completed direct operator review and accepted this presentation.
+Temporary trial backups and rollback artifacts were removed on request.
+
+The user approved horizontal Target Actions, Esc-only menu cancellation,
+shortening the visible label `Duplicate as New` to `Duplicate`, and vertical
+selection-following scrolling. Channel selection stays vertical and has no
+search. The same small list renderer centers selection where possible for
+Dashboard targets, node selection, channel pickers, and creation-mode choices.
+There is no new service operation or background work.
+
+Production inventory: `main` at `49d6190` renders Dashboard and picker rows as
+vertical Ratatui lists with teal selected backgrounds and Vim/arrow selection;
+Details explicitly centers the playlist viewport. The current rewrite's
+vertical Target Actions was a previously approved addition, not an old
+production screen. Its horizontal presentation is the specific new ruling.
+Retain frame geometry, colors, option order, confirmations, and typed effects.
+
+| operator state | input/event | service source/effect | client behavior | verification | ruling |
+| --- | --- | --- | --- | --- | --- |
+| Target Actions | h/l, Left/Right, Enter, Esc | Existing typed lifecycle/topology/channel operations, unchanged | One horizontally scrolling line; selected option retains white/bold text with teal background; only Esc cancels | Updated pure input test, full disabled-menu buffer, and 20-column selected-option coverage | Approved |
+| Duplicate workflow | Open Duplicate | Existing typed add(from) | Shorter label in action menu and prompt title; workflow unchanged | Existing duplicate workflow/render tests updated | Approved |
+| Vertical lists | Navigate or resize | Snapshot targets/endpoints or typed channel catalog | Center selection where possible, clamp viewport at list ends, retain original row numbering and styling | Existing buffers plus both channel-picker variants at 40x10 and 40x8 | Approved |
+
+State/render checks passed. Direct live terminal review is pending the user's
+check of the release binary; these checks do not claim full production parity.
+
 ### Approved Details/current-playlist behavior
 
 | operator job | service source/effect | approved client behavior | mapping | ruling |
@@ -269,3 +319,33 @@ default `\` binding.
 | Loop/repeat | Authoritative loop state and typed setters | `L` toggles current-item loop; `P` toggles queue repeat; both remain visible in the header | typed-existing | **Approved** |
 | Save the queue | Typed managed-channel save | `S` saves exact live order, confirms overwrite, and never assigns the channel | typed-existing | **Approved** |
 | Refresh and errors | Snapshot watch, typed playlist query, correlated results | Refresh on entry, mutation, and playlist position/count changes; retain selection by stable ID; use the footer for results and current playback errors | typed-existing + client-owned | **Approved** |
+
+### Client efficiency pass (November 10, 2026)
+
+Additional approved Dashboard ordering: disabled targets move below all enabled
+targets, retaining service order within each group. Apply on connection and
+every snapshot; keep keyboard selection on the same target when it moves.
+Offline/stopped enabled targets stay in the enabled group. One combined
+state/buffer regression covers ordering, row rendering, and selection through
+disable/re-enable. This is client-only presentation of authoritative records;
+production row text, colors, and input bindings remain unchanged. Live and
+direct interactive comparison for this ordering change remains unperformed.
+
+Production reference: `main` at `49d6190`, Details renderer and key handler in
+`tui/panebot-tui/src/main.rs`. Retain the five-region frame, row selection and
+current/marked/search treatments, contextual prompts, keys, and ordered queue
+actions, with the previously approved Details differences above. This pass
+changes internal work, not those labels or controls.
+
+| input/event | service source/effect | tightened implementation | verification |
+| --- | --- | --- | --- |
+| Move To Next | Typed playlist read and move | Reuse one pre-move read, then refresh after completion | Isolated public-client exercise: two playlist reads total, correct resulting order |
+| Loop / Repeat / Save | Typed setters/save result and authoritative snapshots | Omit the unconditional full-playlist read | Isolated public-client exercise: zero client playlist reads for each; Save preserves order and does not assign a channel |
+| Count/position changes during reads or edits | Snapshot watch and typed playlist read | One read in flight; remember one follow-up; defer reads during edits; read completion cannot unlock the edit | Three focused state tests covering read/edit ordering, coalescing, failures and receipt-only completion |
+| Details render during Search | Client search over typed playlist items | Share one match calculation between body and footer | Six before/after fixed buffers, including styles, match at 80x10 and 120x24 across Normal, Search, and item confirmation |
+| Unhandled terminal event / obsolete connection-generation update | Client event dispatch | Skip the redraw for these known no-ops | Source review; ordinary key handling and resize redraw retained |
+
+The public-client exercise used an isolated localhost daemon and headless mpv
+with temporary files, not deployed targets. Direct interactive comparison with
+the old production client and a real remote host was not performed in this pass;
+buffer equality is not a claim of complete production UI parity.

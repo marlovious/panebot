@@ -67,7 +67,8 @@ pub enum ServiceUpdate {
     DetailsCompleted {
         generation: u64,
         target: String,
-        result: Result<(String, Vec<mpv_targets::PlaylistItem>), String>,
+        refresh: bool,
+        result: Result<String, String>,
     },
 }
 
@@ -96,10 +97,15 @@ pub async fn run_details_action(
     action: details::Action,
     updates: UnboundedSender<ServiceUpdate>,
 ) {
+    let refresh = !matches!(
+        action,
+        details::Action::Loop(_) | details::Action::Repeat(_) | details::Action::Save { .. }
+    );
     let result = execute_details_action(&client, &target, action).await;
     let _ = updates.send(ServiceUpdate::DetailsCompleted {
         generation,
         target,
+        refresh,
         result,
     });
 }
@@ -108,7 +114,7 @@ async fn execute_details_action(
     client: &RemoteClient,
     target: &str,
     action: details::Action,
-) -> Result<(String, Vec<mpv_targets::PlaylistItem>), String> {
+) -> Result<String, String> {
     use details::Action;
     use mpv_targets::{LoadMode, LoopState};
     let t = client.target(target.to_owned());
@@ -123,7 +129,7 @@ async fn execute_details_action(
                 let items = t.playlist().await.map_err(|e| e.to_string())?;
                 let current = items.iter().position(|x| x.current);
                 let destination = current.map_or(0, |c| c + 1);
-                move_block(&t, vec![i], destination).await?;
+                move_block(&t, items, vec![i], destination).await?;
                 if current.is_none() {
                     "Moved to front".into()
                 } else {
@@ -134,7 +140,8 @@ async fn execute_details_action(
                 indices,
                 destination,
             } => {
-                move_block(&t, indices, destination).await?;
+                let items = t.playlist().await.map_err(|e| e.to_string())?;
+                move_block(&t, items, indices, destination).await?;
                 "Queue reordered".into()
             }
             Action::Remove {
@@ -221,16 +228,15 @@ async fn execute_details_action(
                 format!("Queue Repeat {}", if on { "On" } else { "Off" })
             }
         };
-    let items = t.playlist().await.map_err(|e| e.to_string())?;
-    Ok((message, items))
+    Ok(message)
 }
 
 async fn move_block(
     t: &mpv_targets::TargetClient,
+    items: Vec<mpv_targets::PlaylistItem>,
     indices: Vec<usize>,
     destination: usize,
 ) -> Result<(), String> {
-    let items = t.playlist().await.map_err(|e| e.to_string())?;
     let ids: Vec<u64> = indices
         .iter()
         .filter_map(|i| items.get(*i).map(|x| x.id))
@@ -300,6 +306,22 @@ async fn execute_dashboard_action(
     action: DashboardAction,
 ) -> Result<String, String> {
     match action {
+        DashboardAction::Identify => {
+            let snapshot = client.snapshot().await.ok_or("Service is not connected")?;
+            let mut count = 0;
+            for target in snapshot.targets.iter().filter(|target| target.online) {
+                client
+                    .target(&target.name)
+                    .show_text(
+                        format!(r"${{osd-ass-cc/0}}{{\\fs50}}{}", target.name.to_uppercase()),
+                        4000,
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?;
+                count += 1;
+            }
+            Ok(format!("Identified {count} targets"))
+        }
         DashboardAction::Lifecycle { target, action } => {
             let target_client = client.target(target.clone());
             match action {

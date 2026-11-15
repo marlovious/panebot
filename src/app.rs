@@ -33,7 +33,7 @@ impl TargetAction {
             Self::Rename => "Rename",
             Self::Remove => "Remove",
             Self::SetChannel => "Set Channel",
-            Self::Duplicate => "Duplicate as New",
+            Self::Duplicate => "Duplicate",
         }
     }
 }
@@ -53,6 +53,7 @@ impl LifecycleAction {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum DashboardAction {
+    Identify,
     Lifecycle {
         target: String,
         action: LifecycleAction,
@@ -356,6 +357,9 @@ impl App {
                     }
                     KeyCode::Char('S') => self.solo(),
                     KeyCode::Char('P') => self.toggle_all(),
+                    KeyCode::Char('I') if !self.is_busy() => {
+                        self.start_action("Identifying targets…".into(), DashboardAction::Identify)
+                    }
                     KeyCode::Char('N') => {
                         if self.is_busy() {
                             return None;
@@ -429,34 +433,19 @@ impl App {
         &mut self,
         target: &str,
         result: Result<Vec<mpv_targets::PlaylistItem>, String>,
-    ) {
-        let Some(details) = self.details.as_mut().filter(|d| d.target == target) else {
-            return;
-        };
-        match result {
-            Ok(items) => details.refresh(items),
-            Err(error) => details.complete(Err(error)),
-        }
+    ) -> Option<String> {
+        let details = self.details.as_mut().filter(|d| d.target == target)?;
+        details.playlist_loaded(result).then(|| target.to_owned())
     }
 
     pub fn details_completed(
         &mut self,
         target: &str,
-        result: Result<(String, Vec<mpv_targets::PlaylistItem>), String>,
-    ) {
-        if let Some(details) = self.details.as_mut().filter(|d| d.target == target) {
-            if let Err(error) = &result
-                && let Some(channel) = error.strip_prefix("__OVERWRITE__")
-            {
-                details.busy = false;
-                details.mode = details::Mode::Save {
-                    input: channel.into(),
-                    overwrite: true,
-                };
-                return;
-            }
-            details.complete(result);
-        }
+        refresh: bool,
+        result: Result<String, String>,
+    ) -> Option<String> {
+        let details = self.details.as_mut().filter(|d| d.target == target)?;
+        details.complete(result, refresh).then(|| target.to_owned())
     }
 
     pub fn retrying(&mut self, endpoint: Endpoint, error: String) {
@@ -467,13 +456,15 @@ impl App {
         };
     }
 
-    pub fn connected(&mut self, endpoint: Endpoint, snapshot: Snapshot) {
+    pub fn connected(&mut self, endpoint: Endpoint, mut snapshot: Snapshot) {
+        snapshot.targets.sort_by_key(|target| target.disabled);
         self.target_selected = 0;
         self.reset_transient();
         self.view = View::Connected { endpoint, snapshot };
     }
 
-    pub fn apply_snapshot(&mut self, snapshot: Snapshot) -> Option<String> {
+    pub fn apply_snapshot(&mut self, mut snapshot: Snapshot) -> Option<String> {
+        snapshot.targets.sort_by_key(|target| target.disabled);
         let refresh = self.details.as_ref().and_then(|details| {
             let old = self.selected_target()?.state.playlist_count;
             let new = snapshot
@@ -525,7 +516,11 @@ impl App {
                 ));
             }
         }
-        refresh
+        refresh.filter(|_| {
+            self.details
+                .as_mut()
+                .is_some_and(|details| details.request_refresh())
+        })
     }
 
     pub fn selected_target(&self) -> Option<&mpv_targets::TargetRecord> {
@@ -944,15 +939,15 @@ impl App {
     fn handle_action_picker_key(&mut self, key: KeyEvent) -> Option<Effect> {
         let picker = self.action_picker.as_mut()?;
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Char('l') | KeyCode::Right | KeyCode::Char('j') | KeyCode::Down => {
                 picker.selected = (picker.selected + 1).min(picker.actions.len().saturating_sub(1));
                 None
             }
-            KeyCode::Char('k') | KeyCode::Up => {
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Char('k') | KeyCode::Up => {
                 picker.selected = picker.selected.saturating_sub(1);
                 None
             }
-            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+            KeyCode::Esc => {
                 self.action_picker = None;
                 None
             }
@@ -1071,7 +1066,7 @@ impl App {
                     prompt.stage = ManagementStage::Confirming;
                     None
                 }
-                KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+                KeyCode::Esc => {
                     prompt.stage = ManagementStage::Editing;
                     None
                 }
@@ -1384,6 +1379,47 @@ mod tests {
     }
 
     #[test]
+    fn disabled_targets_sort_last_and_selection_follows_them() {
+        let mut app = app();
+        let mut state = snapshot(&["daily", "dat", "gents", "other"]);
+        state.targets[0].disabled = true;
+        state.targets[2].disabled = true;
+        state.targets[3].online = false;
+        app.connected(app.endpoints[0].clone(), state.clone());
+        let names = |app: &App| match &app.view {
+            View::Connected { snapshot, .. } => snapshot
+                .targets
+                .iter()
+                .map(|target| target.name.clone())
+                .collect::<Vec<_>>(),
+            _ => unreachable!(),
+        };
+        assert_eq!(names(&app), ["dat", "other", "daily", "gents"]);
+
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 8)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::render(frame, &app))
+            .unwrap();
+        for (row, name) in ["DAT", "OTHER", "DAILY", "GENTS"].iter().enumerate() {
+            let line = (0..100)
+                .map(|x| terminal.backend().buffer().get(x, row as u16 + 2).symbol())
+                .collect::<String>();
+            assert!(line.contains(&format!("\"{name}\"")));
+        }
+
+        state.targets[1].disabled = true;
+        app.apply_snapshot(state.clone());
+        assert_eq!(names(&app), ["other", "daily", "dat", "gents"]);
+        assert_eq!(app.selected_target().unwrap().name, "dat");
+        assert_eq!(app.target_selected, 2);
+        state.targets[1].disabled = false;
+        app.apply_snapshot(state);
+        assert_eq!(app.target_selected, 0);
+        assert_eq!(app.selected_target().unwrap().name, "dat");
+    }
+
+    #[test]
     fn lifecycle_picker_tracks_service_native_target_state() {
         let mut target = snapshot(&["daily"]).targets.remove(0);
         target.disabled = true;
@@ -1458,8 +1494,39 @@ mod tests {
         assert_eq!(app.handle_key(key(KeyCode::Enter)), None);
         assert_eq!(app.action_picker.as_ref().unwrap().target, "dat");
         app.handle_key(key(KeyCode::Left));
+        assert_eq!(app.action_picker.as_ref().unwrap().selected, 0);
+        app.handle_key(key(KeyCode::Char('l')));
+        assert_eq!(app.action_picker.as_ref().unwrap().selected, 1);
+        app.handle_key(key(KeyCode::Char('h')));
+        assert_eq!(app.action_picker.as_ref().unwrap().selected, 0);
+        for _ in 0..10 {
+            app.handle_key(key(KeyCode::Right));
+        }
+        let picker = app.action_picker.as_ref().unwrap();
+        assert_eq!(picker.selected, picker.actions.len() - 1);
+        app.handle_key(key(KeyCode::Esc));
         assert!(app.action_picker.is_none());
         assert_eq!(app.selected_target().unwrap().name, "dat");
+    }
+
+    #[test]
+    fn identify_is_a_normal_dashboard_action_and_blocks_duplicates() {
+        let mut app = app();
+        app.connected(app.endpoints[0].clone(), snapshot(&["daily"]));
+        app.handle_key(key(KeyCode::Enter));
+        assert_eq!(app.handle_key(key(KeyCode::Char('I'))), None);
+        app.handle_key(key(KeyCode::Esc));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(app.handle_key(key(KeyCode::Char('I'))), None);
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(
+            app.handle_key(key(KeyCode::Char('I'))),
+            Some(Effect::Run(DashboardAction::Identify))
+        );
+        assert_eq!(app.handle_key(key(KeyCode::Char('I'))), None);
+        app.complete_action(Ok("Identified 1 targets".into()));
+        app.handle_key(key(KeyCode::Right));
+        assert_eq!(app.handle_key(key(KeyCode::Char('I'))), None);
     }
 
     #[test]

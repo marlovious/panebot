@@ -79,9 +79,13 @@ async fn main() -> io::Result<()> {
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel();
     let mut connection: Option<Connection> = None;
     let mut next_generation = 1_u64;
+    let mut redraw = true;
 
     loop {
-        terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+        if redraw {
+            terminal.terminal.draw(|frame| ui::render(frame, &app))?;
+        }
+        redraw = true;
         tokio::select! {
             event = events.next() => match event {
                 Some(Ok(Event::Key(key))) => {
@@ -141,7 +145,7 @@ async fn main() -> io::Result<()> {
                                     && let Some(client) = active.client.clone() {
                                     tokio::spawn(run_details_action(active.generation, client, target, action, updates_tx.clone()));
                                 } else {
-                                    app.details_completed(&target, Err("Service is not connected".into()));
+                                    app.details_completed(&target, false, Err("Service is not connected".into()));
                                 }
                             }
                         }
@@ -149,7 +153,7 @@ async fn main() -> io::Result<()> {
                 }
                 Some(Ok(Event::Resize(_, _))) => terminal.terminal.clear()?,
                 Some(Ok(Event::Paste(value))) => app.handle_paste(value),
-                Some(Ok(_)) => {}
+                Some(Ok(_)) => redraw = false,
                 Some(Err(error)) => return Err(error),
                 None => break,
             },
@@ -178,10 +182,20 @@ async fn main() -> io::Result<()> {
                     ServiceUpdate::ChannelsLoaded { generation, result }
                         if active_generation == Some(generation) => app.channels_loaded(result),
                     ServiceUpdate::PlaylistLoaded { generation, target, result }
-                        if active_generation == Some(generation) => app.playlist_loaded(&target, result),
-                    ServiceUpdate::DetailsCompleted { generation, target, result }
-                        if active_generation == Some(generation) => app.details_completed(&target, result),
-                    _ => {}
+                        if active_generation == Some(generation) => {
+                            if let Some(target) = app.playlist_loaded(&target, result)
+                                && let Some(client) = connection.as_ref().and_then(|a| a.client.clone()) {
+                                tokio::spawn(load_playlist(generation, client, target, updates_tx.clone()));
+                            }
+                        }
+                    ServiceUpdate::DetailsCompleted { generation, target, refresh, result }
+                        if active_generation == Some(generation) => {
+                            if let Some(target) = app.details_completed(&target, refresh, result)
+                                && let Some(client) = connection.as_ref().and_then(|a| a.client.clone()) {
+                                tokio::spawn(load_playlist(generation, client, target, updates_tx.clone()));
+                            }
+                        }
+                    _ => redraw = false,
                 }
             }
         }

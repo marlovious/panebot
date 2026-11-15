@@ -53,6 +53,12 @@ pub fn divider(frame: &mut Frame<'_>, area: Rect) {
     );
 }
 
+pub fn list_offset(selected: usize, count: usize, height: usize) -> usize {
+    selected
+        .saturating_sub(height / 2)
+        .min(count.saturating_sub(height))
+}
+
 pub fn selectable_list(frame: &mut Frame<'_>, area: Rect, rows: Vec<Line<'_>>, selected: usize) {
     selectable_list_color(frame, area, rows, selected, SELECTED);
 }
@@ -64,9 +70,13 @@ pub fn selectable_list_color(
     selected: usize,
     selected_color: Color,
 ) {
+    let height = area.height as usize;
+    let offset = list_offset(selected, rows.len(), height);
     let items = rows
         .into_iter()
         .enumerate()
+        .skip(offset)
+        .take(height)
         .map(|(index, row)| {
             let item = ListItem::new(row);
             if index == selected {

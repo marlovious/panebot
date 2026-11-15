@@ -36,6 +36,14 @@ pub enum AddStage {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+enum Activity {
+    Idle,
+    Loading,
+    Action,
+    Refreshing(Result<String, String>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub struct Details {
     pub target: String,
     pub items: Vec<PlaylistItem>,
@@ -43,7 +51,9 @@ pub struct Details {
     pub marks: HashSet<u64>,
     pub mode: Mode,
     pub status: Option<(String, bool)>,
-    pub busy: bool,
+    activity: Activity,
+    refresh_in_flight: bool,
+    refresh_needed: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -88,7 +98,9 @@ impl Details {
             marks: HashSet::new(),
             mode: Mode::Normal,
             status: Some(("Loading playlist...".into(), false)),
-            busy: true,
+            activity: Activity::Loading,
+            refresh_in_flight: true,
+            refresh_needed: false,
         }
     }
 
@@ -100,7 +112,10 @@ impl Details {
             .unwrap_or_else(|| self.selected.min(self.items.len().saturating_sub(1)));
         self.marks
             .retain(|id| self.items.iter().any(|item| item.id == *id));
-        self.busy = false;
+        self.refresh_in_flight = false;
+        if self.activity == Activity::Loading {
+            self.activity = Activity::Idle;
+        }
         if self
             .status
             .as_ref()
@@ -110,15 +125,72 @@ impl Details {
         }
     }
 
-    pub fn complete(&mut self, result: Result<(String, Vec<PlaylistItem>), String>) {
-        self.busy = false;
-        match result {
-            Ok((message, items)) => {
-                self.refresh(items);
-                self.status = Some((message, false));
-            }
-            Err(error) => self.status = Some((error, true)),
+    pub fn is_busy(&self) -> bool {
+        self.activity != Activity::Idle
+    }
+
+    pub fn request_refresh(&mut self) -> bool {
+        self.refresh_needed = true;
+        self.take_refresh()
+    }
+
+    fn take_refresh(&mut self) -> bool {
+        if !self.refresh_needed || self.refresh_in_flight || self.activity == Activity::Action {
+            return false;
         }
+        self.refresh_needed = false;
+        self.refresh_in_flight = true;
+        true
+    }
+
+    pub fn playlist_loaded(&mut self, result: Result<Vec<PlaylistItem>, String>) -> bool {
+        self.refresh_in_flight = false;
+        let error = match result {
+            Ok(items) => {
+                self.refresh(items);
+                None
+            }
+            Err(error) => Some(error),
+        };
+        if self.take_refresh() {
+            return true;
+        }
+        if !matches!(self.activity, Activity::Action) {
+            let activity = std::mem::replace(&mut self.activity, Activity::Idle);
+            if let Activity::Refreshing(result) = activity {
+                // Preserve an edit failure even if the recovery read also failed.
+                self.show_result(result.and_then(|message| error.map_or(Ok(message), Err)));
+            } else if let Some(error) = error {
+                self.show_result(Err(error));
+            }
+        }
+        false
+    }
+
+    pub fn complete(&mut self, result: Result<String, String>, refresh: bool) -> bool {
+        if let Err(error) = &result
+            && let Some(channel) = error.strip_prefix("__OVERWRITE__")
+        {
+            self.activity = Activity::Idle;
+            self.mode = Mode::Save {
+                input: channel.into(),
+                overwrite: true,
+            };
+        } else if refresh {
+            self.activity = Activity::Refreshing(result);
+            return self.request_refresh();
+        } else {
+            self.activity = Activity::Idle;
+            self.show_result(result);
+        }
+        self.take_refresh()
+    }
+
+    fn show_result(&mut self, result: Result<String, String>) {
+        self.status = Some(match result {
+            Ok(message) => (message, false),
+            Err(error) => (error, true),
+        });
     }
 
     pub fn paste(&mut self, value: String) {
@@ -147,7 +219,7 @@ impl Details {
         loop_on: bool,
         repeat_on: bool,
     ) -> Option<Effect> {
-        if self.busy {
+        if self.is_busy() {
             return None;
         }
         match self.mode.clone() {
@@ -396,7 +468,7 @@ impl Details {
         }
     }
     fn run(&mut self, action: Action) -> Option<Effect> {
-        self.busy = true;
+        self.activity = Activity::Action;
         self.marks.clear();
         Some(Effect::Run {
             target: self.target.clone(),
@@ -727,6 +799,72 @@ mod tests {
             item(10, "Alpha", true),
         ]);
         assert_eq!(d.selected, 1);
+    }
+
+    #[test]
+    fn refreshes_coalesce_and_do_not_unlock_an_edit() {
+        let mut d = details();
+        assert!(d.request_refresh());
+        assert!(!d.request_refresh());
+        d.handle(key(KeyCode::Char('Z')), 5, Some(0), false, false);
+
+        // A read started before the edit may finish while the edit is running.
+        assert!(!d.playlist_loaded(Ok(d.items.clone())));
+        assert!(d.is_busy());
+        assert_eq!(
+            d.handle(key(KeyCode::Char('Z')), 5, Some(0), false, false),
+            None
+        );
+        assert!(d.complete(Ok("Queue shuffled".into()), true));
+        assert!(!d.request_refresh());
+        assert!(!d.request_refresh());
+        // Several changes during one read require only one follow-up read.
+        assert!(d.playlist_loaded(Ok(d.items.clone())));
+        assert!(d.is_busy());
+        assert!(!d.playlist_loaded(Ok(d.items.clone())));
+        assert!(!d.is_busy());
+        assert_eq!(d.status, Some(("Queue shuffled".into(), false)));
+    }
+
+    #[test]
+    fn edit_completion_waits_for_a_read_started_before_it() {
+        let mut d = details();
+        assert!(d.request_refresh());
+        d.handle(key(KeyCode::Char('Z')), 5, Some(0), false, false);
+        assert!(!d.complete(Ok("Queue shuffled".into()), true));
+        assert!(d.playlist_loaded(Ok(d.items.clone())));
+        assert!(d.is_busy());
+        assert!(!d.playlist_loaded(Ok(d.items.clone())));
+        assert!(!d.is_busy());
+
+        d.handle(key(KeyCode::Char('Z')), 5, Some(0), false, false);
+        assert!(d.complete(Err("edit failed".into()), true));
+        assert!(!d.playlist_loaded(Err("refresh failed".into())));
+        assert!(!d.is_busy());
+        assert_eq!(d.status, Some(("edit failed".into(), true)));
+    }
+
+    #[test]
+    fn non_queue_completion_does_not_request_a_playlist() {
+        let mut d = details();
+        for action in [
+            Action::Loop(true),
+            Action::Repeat(true),
+            Action::Save {
+                channel: "saved.m3u".into(),
+                overwrite: false,
+            },
+        ] {
+            d.run(action);
+            assert!(!d.complete(Ok("done".into()), false));
+            assert!(!d.is_busy());
+        }
+        d.run(Action::Save {
+            channel: "saved.m3u".into(),
+            overwrite: false,
+        });
+        assert!(!d.complete(Err("__OVERWRITE__saved.m3u".into()), false));
+        assert!(matches!(&d.mode, Mode::Save { input, overwrite: true } if input == "saved.m3u"));
     }
 
     #[test]

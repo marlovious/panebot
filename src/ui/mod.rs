@@ -133,39 +133,6 @@ fn render_dashboard(
         render_channel_prompt(frame, rows[2], prompt);
     } else if let Some(prompt) = &app.management_prompt {
         render_management_prompt(frame, rows[2], prompt);
-    } else if let Some(picker) = &app.action_picker {
-        let action_rows = picker
-            .actions
-            .iter()
-            .enumerate()
-            .map(|(index, action)| {
-                let selected = index == picker.selected;
-                Line::from(vec![
-                    Span::styled(
-                        if selected { ":: " } else { "   " },
-                        Style::default().fg(ORANGE),
-                    ),
-                    selected_label(action.label().to_owned(), selected),
-                ])
-            })
-            .collect();
-        let areas = ratatui::layout::Layout::vertical([
-            ratatui::layout::Constraint::Length(1),
-            ratatui::layout::Constraint::Min(1),
-        ])
-        .split(rows[2]);
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("Actions", Style::default().fg(HINT)),
-                separator(),
-                Span::styled(
-                    format!("\"{}\"", picker.target.to_uppercase()),
-                    Style::default().fg(WHITE),
-                ),
-            ])),
-            areas[0],
-        );
-        selectable_list(frame, areas[1], action_rows, picker.selected);
     } else {
         let name_width = snapshot
             .targets
@@ -178,6 +145,9 @@ fn render_dashboard(
             .iter()
             .enumerate()
             .map(|(index, target)| {
+                if index == app.target_selected && app.action_picker.is_some() {
+                    return Line::default();
+                }
                 target_row(
                     target,
                     name_width,
@@ -201,6 +171,75 @@ fn render_dashboard(
                 SELECTED
             },
         );
+        if let Some(picker) = &app.action_picker {
+            let offset = list_offset(
+                app.target_selected,
+                snapshot.targets.len(),
+                rows[2].height as usize,
+            );
+            let y = app.target_selected.saturating_sub(offset) as u16;
+            if y < rows[2].height {
+                let area = ratatui::layout::Rect::new(rows[2].x, rows[2].y + y, rows[2].width, 1);
+                let prefix = Line::from(vec![
+                    Span::styled(":: ", Style::default().fg(ORANGE)),
+                    Span::styled(
+                        format!(
+                            "{:<name_width$}",
+                            format!("\"{}\"", picker.target.to_uppercase())
+                        ),
+                        Style::default().fg(WHITE).add_modifier(Modifier::BOLD),
+                    ),
+                    separator(),
+                ]);
+                let action_width = picker
+                    .actions
+                    .iter()
+                    .map(|action| action.label().len())
+                    .max()
+                    .unwrap_or(0);
+                let prefix_width = prefix
+                    .width()
+                    .min((area.width as usize).saturating_sub(action_width))
+                    as u16;
+                let style = Style::default().bg(SELECTED);
+                frame.render_widget(
+                    Paragraph::new(prefix).style(style),
+                    ratatui::layout::Rect::new(area.x, area.y, prefix_width, 1),
+                );
+                let actions_area = ratatui::layout::Rect::new(
+                    area.x + prefix_width,
+                    area.y,
+                    area.width - prefix_width,
+                    1,
+                );
+                let mut line = Line::default();
+                let mut selected_start = 0;
+                let mut selected_end = 0;
+                for (index, action) in picker.actions.iter().enumerate() {
+                    if index > 0 {
+                        line.spans.push(separator());
+                    }
+                    let selected = index == picker.selected;
+                    if selected {
+                        selected_start = line.width();
+                        selected_end = selected_start + action.label().len();
+                    }
+                    let mut label = selected_label(action.label().to_owned(), selected);
+                    if selected {
+                        label.style = label.style.bg(SELECTED);
+                    }
+                    line.spans.push(label);
+                }
+
+                let offset = selected_end
+                    .saturating_sub(actions_area.width as usize)
+                    .min(selected_start);
+                frame.render_widget(
+                    Paragraph::new(line).style(style).scroll((0, offset as u16)),
+                    actions_area,
+                );
+            }
+        }
     }
 
     divider(frame, rows[3]);
@@ -216,7 +255,7 @@ fn render_dashboard(
 fn dashboard_footer(app: &App) -> Line<'static> {
     if app.action_picker.is_some() {
         return Line::from(Span::styled(
-            "[j/k] Select :: [Enter] Perform :: [Esc/h] Back",
+            "[h/l] Select :: [Enter] Perform :: [Esc] Back",
             Style::default().fg(DIM),
         ));
     }
@@ -227,7 +266,7 @@ fn dashboard_footer(app: &App) -> Line<'static> {
             } else if p.stage == ManagementStage::Confirming {
                 "[y] Confirm :: [n/Enter/Esc] Cancel"
             } else if p.stage == ManagementStage::ChoosingMode {
-                "[j/k] Select :: [Enter] Continue :: [Esc/h] Back"
+                "[j/k] Select :: [Enter] Continue :: [Esc] Back"
             } else {
                 "[Enter] Continue :: [Esc] Back"
             },
@@ -260,7 +299,7 @@ fn dashboard_footer(app: &App) -> Line<'static> {
         ));
     }
     Line::from(Span::styled(
-        "[Enter] Target Actions :: [Tab] Send Command :: [S] Solo :: [P] Play/Pause All :: [N] New Target :: [l/→] Details :: [C] Nodes :: [q] Quit",
+        "[Enter] Target Actions :: [Tab] Send Command :: [S] Solo :: [P] Play/Pause All :: [I] Identify :: [N] New Target :: [l/→] Details :: [C] Nodes :: [q] Quit",
         Style::default().fg(DIM),
     ))
 }
@@ -454,7 +493,10 @@ fn render_details(frame: &mut Frame<'_>, app: &App, details: &crate::details::De
         .collect();
     frame.render_widget(ratatui::widgets::List::new(lines), rows[2]);
     divider(frame, rows[3]);
-    frame.render_widget(Paragraph::new(details_footer(details, target)), rows[4]);
+    frame.render_widget(
+        Paragraph::new(details_footer(details, target, &matches)),
+        rows[4],
+    );
 }
 
 fn clock(seconds: f64) -> String {
@@ -472,6 +514,7 @@ fn tail(value: &str, width: usize) -> String {
 fn details_footer(
     d: &crate::details::Details,
     target: &mpv_targets::TargetRecord,
+    matches: &[usize],
 ) -> Line<'static> {
     use crate::details::{AddStage, Mode};
     if matches!(d.mode, Mode::Normal) {
@@ -480,7 +523,7 @@ fn details_footer(
                 Span::styled(
                     if *error {
                         "Error"
-                    } else if d.busy {
+                    } else if d.is_busy() {
                         "Working"
                     } else {
                         "Done"
@@ -526,7 +569,7 @@ fn details_footer(
             Span::styled(" :: Cancel [Esc]", Style::default().fg(DIM)),
         ]),
         Mode::Search { query, .. } => {
-            let m = d.matches();
+            let m = matches;
             Line::from(Span::styled(
                 if query.is_empty() {
                     "/ :: [Enter/Esc] Cancel".into()
@@ -1081,7 +1124,7 @@ mod tests {
         assert_eq!(lines[5], "-".repeat(160));
         assert_eq!(
             lines[6].trim_end(),
-            "[Enter] Target Actions :: [Tab] Send Command :: [S] Solo :: [P] Play/Pause All :: [N] New Target :: [l/→] Details :: [C] Nodes :: [q] Quit"
+            "[Enter] Target Actions :: [Tab] Send Command :: [S] Solo :: [P] Play/Pause All :: [I] Identify :: [N] New Target :: [l/→] Details :: [C] Nodes :: [q] Quit"
         );
     }
 
@@ -1124,14 +1167,95 @@ mod tests {
             vec![
                 "[PaneBot] :: [fez] :: wss://127.0.0.1:9876 :: Targets: 0/1              ",
                 "------------------------------------------------------------------------",
-                "Actions :: \"DAILY\"                                                      ",
-                ":: Enable                                                               ",
-                "   Enable & Start                                                       ",
-                "   Set Channel                                                          ",
+                ":: \"DAILY\" :: Enable :: Enable & Start :: Set Channel :: Duplicate      ",
+                "                                                                        ",
+                "                                                                        ",
+                "                                                                        ",
                 "------------------------------------------------------------------------",
-                "[j/k] Select :: [Enter] Perform :: [Esc/h] Back                         ",
+                "[h/l] Select :: [Enter] Perform :: [Esc] Back                           ",
             ]
         );
+    }
+
+    #[test]
+    fn horizontal_actions_keep_the_selection_visible_in_a_narrow_terminal() {
+        let mut app = one_target_app();
+        if let View::Connected { snapshot, .. } = &mut app.view {
+            let mut other = snapshot.targets[0].clone();
+            other.name = "other".into();
+            snapshot.targets.push(other);
+        }
+        let before = rendered_lines(&app, 80, 8);
+        let key =
+            |code| crossterm::event::KeyEvent::new(code, crossterm::event::KeyModifiers::NONE);
+        app.handle_key(key(crossterm::event::KeyCode::Enter));
+        for expected in ["Restart", "Stop", "Disable", "Set Channel", "Duplicate"] {
+            let lines = rendered_lines(&app, 20, 8);
+            assert!(lines[2].contains(expected), "{:?}", lines[2]);
+            assert!(lines[3].contains("\"OTHER\""));
+            app.handle_key(key(crossterm::event::KeyCode::Right));
+        }
+        app.handle_key(key(crossterm::event::KeyCode::Left));
+        assert!(rendered_lines(&app, 20, 8)[2].contains("Set Channel"));
+        app.handle_key(key(crossterm::event::KeyCode::Esc));
+        assert_eq!(rendered_lines(&app, 80, 8), before);
+    }
+
+    #[test]
+    fn channel_pickers_scroll_with_selection_and_resize() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let channels = (0..12)
+            .map(|i| format!("channel{i}.m3u"))
+            .collect::<Vec<_>>();
+        for creating in [false, true] {
+            let mut app = one_target_app();
+            if creating {
+                app.new_target_prompt = Some(NewTargetPrompt {
+                    input: "new".into(),
+                    stage: NewTargetStage::ChannelPicker,
+                    channels: channels.clone(),
+                    channel: None,
+                    selected: 0,
+                    play_on_start: false,
+                    mute_on_start: true,
+                    mode_selected: 0,
+                    error: None,
+                    busy: false,
+                });
+            } else {
+                app.channel_prompt = Some(ChannelPrompt {
+                    target: "daily".into(),
+                    channels: channels.clone(),
+                    selected: 0,
+                    channel: None,
+                    restart_available: true,
+                    stage: ChannelStage::Picking,
+                    error: None,
+                    busy: false,
+                });
+            }
+            for _ in 0..9 {
+                app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            assert_eq!(
+                rendered_lines(&app, 40, 10)[6].trim_end(),
+                ":: 10. channel9.m3u"
+            );
+            assert_eq!(
+                rendered_lines(&app, 40, 8)[5].trim_end(),
+                ":: 10. channel9.m3u"
+            );
+            let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+            terminal.draw(|frame| render(frame, &app)).unwrap();
+            assert_eq!(terminal.backend().buffer().get(0, 6).bg, SELECTED);
+            for _ in 0..9 {
+                app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+            }
+            assert_eq!(
+                rendered_lines(&app, 40, 10)[4].trim_end(),
+                ":: 1. channel0.m3u"
+            );
+        }
     }
 
     #[test]
@@ -1204,14 +1328,14 @@ mod tests {
         app.handle_key(key(crossterm::event::KeyCode::Enter));
 
         let lines = rendered_lines(&app, 80, 10);
-        assert_eq!(lines[2].trim_end(), "Duplicate as New :: \"DAILY\"");
+        assert_eq!(lines[2].trim_end(), "Duplicate :: \"DAILY\"");
         assert_eq!(lines[3].trim_end(), "\"DAILY-COPY\" from \"DAILY\"");
         assert_eq!(lines[4].trim_end(), ":: Create: Disabled");
         assert_eq!(lines[5].trim_end(), "   Create: Enabled/Stopped");
         assert_eq!(lines[6].trim_end(), "   Create: Enabled/Start");
         assert_eq!(
             lines[9].trim_end(),
-            "[j/k] Select :: [Enter] Continue :: [Esc/h] Back"
+            "[j/k] Select :: [Enter] Continue :: [Esc] Back"
         );
 
         app.handle_key(key(crossterm::event::KeyCode::Enter));

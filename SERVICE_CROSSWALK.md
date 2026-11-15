@@ -113,6 +113,7 @@ public boundary.
 | Restart selected target | `TargetClient::restart` | Available |
 | Restart all | select targets from snapshot, call typed restart in display order | Client composition by design |
 | Solo selected | typed unmute, play, fullscreen; typed mute for others | Available; client composition |
+| Identify all online targets | typed `show_text`, matching `targets identify` formatting and duration | Available; client composition |
 | Mute Others | typed mute in display order | Available; client composition |
 | Pause/Play All | select from snapshot, typed pause/play | Available; client composition |
 | Toggle pause/mute | typed toggle methods | Available |

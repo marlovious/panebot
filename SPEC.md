@@ -95,9 +95,9 @@ The rewrite maintains four explicit state groups.
 ### 5.1 Service state
 
 The latest authoritative `mpv_targets::Snapshot`, updated only by the shared
-client. Target order should remain stable for display. If the service order is
-not contractual, PaneBot stores an explicit UI order without duplicating
-target identity.
+client. For display, PaneBot places enabled targets before disabled targets,
+preserving service order within each group. It applies this ordering on initial
+connection and snapshot updates and retains selection by target identity.
 
 ### 5.2 Connection state
 
@@ -287,6 +287,13 @@ but do not accept playback command mode. Idle targets are online and may be
 controlled.
 
 ### 9.4 Dashboard orchestration
+
+Approved Identify shortcut: uppercase `I` in normal Dashboard mode identifies
+every online target on the connected node. Match `targets identify`: uppercase
+target names, ASS font size 50, 4,000 ms, through typed `show_text`. Await results
+in snapshot order and stop on the first error. Use the existing progress/result
+footer and expose `[I] Identify` in the idle hints. It is unavailable inside
+prompts, target actions, command mode, passthrough, and Details.
 
 Production assigns these shortcuts and semantics. Preserve their visible keys
 and feedback; review any service-semantic change before implementation:
@@ -517,7 +524,13 @@ interaction; review service-semantic changes individually:
 - uppercase `Z` immediately invokes the typed standard mpv playlist shuffle,
   clears marks, refreshes the queue, and shows `Queue shuffled`; there is no
   upcoming-only shuffle, Unshuffle action, or fabricated shuffle-state badge;
-- action completion refreshes the live playlist;
+- queue-changing action completion refreshes the live playlist; Loop, Repeat,
+  and Save use their correlated results and authoritative state without an
+  additional playlist query;
+- Details allows one refresh query at a time, folds changes arriving during a
+  query into one follow-up, and defers automatic queries during queue actions;
+  a read reply never releases an action still running, and queue-action feedback
+  completes after its post-action refresh;
 - first failure stops the action and produces a visible correlated error;
 - no rollback transaction is introduced.
 
@@ -558,6 +571,19 @@ events and client request/results may later justify a distinct activity view,
 but none is assumed.
 
 ### 9.10 Setup and target management
+
+Approved inline presentation: Target Actions replaces only the selected target's
+row with its identity and a horizontal action line; all other target rows stay
+visible. Follow-up channel pickers and prompts retain their full-body views.
+`h`/`l` and Left/Right select without wrapping; `j`/`k` and Up/Down remain
+selection aliases. Enter performs the selected action; only Esc closes the
+menu. Scroll the line horizontally as needed to reveal the selected option.
+The visible duplicate action and prompt title are `Duplicate`.
+
+Channel pickers remain vertical with `j`/`k`, Up/Down, Enter, and Esc, without
+search. Shared vertical lists (targets, nodes, channels, creation-mode choices)
+use the playlist's centered selection-following viewport, clamped at the ends.
+Creation-mode menus also use Esc alone for Back; h/Left do not close them.
 
 Locate and inspect the user's referenced implementation before specifying this
 section. Required capabilities already available from the service include add,
